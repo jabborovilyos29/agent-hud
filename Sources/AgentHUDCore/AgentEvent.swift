@@ -13,6 +13,8 @@ public struct AgentEvent: Equatable, Sendable {
         case subagentStopped(agentId: String)
         case stopped(lastMessage: String?, failed: Bool)
         case interrupted
+        /// Запрос разрешения проверяет сам агент (Codex auto_review): пользователя он не ждёт.
+        case autoReviewing(requestId: String)
         /// Служебная сессия самого приложения (не диалог пользователя) — убрать и больше не показывать.
         case internalSession
         case sessionEnded(reason: String?)

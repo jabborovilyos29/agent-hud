@@ -36,7 +36,12 @@ public struct CodexAdapter: AgentAdapter {
         }
 
         if message.mode == .permission {
-            return [make(.permissionRequested(requestId: message.requestId, toolName: toolName, input: input, deadline: deadline))]
+            var out = [make(.permissionRequested(requestId: message.requestId, toolName: toolName, input: input, deadline: deadline))]
+            // В режиме auto_review запрос решает встроенный ревьюер Codex, не дожидаясь хука.
+            if Self.approvalsReviewer(sessionId: sid, transcriptPath: p["transcript_path"]?.stringValue) == "auto_review" {
+                out.append(make(.autoReviewing(requestId: message.requestId)))
+            }
+            return out
         }
         guard message.mode == .event else { return [] }
 
@@ -81,6 +86,42 @@ public struct CodexAdapter: AgentAdapter {
         case .answer, .passthrough:
             return nil
         }
+    }
+
+    // MARK: - Режим проверки запросов
+
+    /// Кто решает запросы разрешения в треде: `user` или `auto_review`.
+    /// В событие хука Codex это не передаёт, но пишет в файл треда (`turn_context`, `thread_settings_applied`);
+    /// берём последнее значение — его могли поменять посреди треда.
+    public static func approvalsReviewer(sessionId: String, transcriptPath: String?, sessionsRoot: URL? = nil, now: Date = Date()) -> String? {
+        guard let url = rolloutFile(sessionId: sessionId, transcriptPath: transcriptPath, sessionsRoot: sessionsRoot, now: now),
+              let data = try? Data(contentsOf: url, options: .alwaysMapped) else { return nil }
+        let key = Data("\"approvals_reviewer\":".utf8)
+        guard let r = data.range(of: key, options: .backwards) else { return nil }
+        var i = r.upperBound
+        while i < data.count, data[i] == UInt8(ascii: " ") { i += 1 }
+        guard i < data.count, data[i] == UInt8(ascii: "\"") else { return nil }
+        let start = i + 1
+        guard let end = data[start...].firstIndex(of: UInt8(ascii: "\"")), end - start < 64 else { return nil }
+        return String(decoding: data[start..<end], as: UTF8.self)
+    }
+
+    /// Файл треда: `transcript_path` из события, иначе поиск `rollout-*-<id>.jsonl` за последние дни.
+    static func rolloutFile(sessionId: String, transcriptPath: String?, sessionsRoot: URL?, now: Date) -> URL? {
+        let fm = FileManager.default
+        if let t = transcriptPath, !t.isEmpty, fm.fileExists(atPath: t) { return URL(fileURLWithPath: t) }
+        guard sessionId.count >= 8 else { return nil }
+        let root = sessionsRoot ?? fm.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
+        let cal = Calendar.current
+        for back in 0..<3 {
+            guard let day = cal.date(byAdding: .day, value: -back, to: now) else { continue }
+            let c = cal.dateComponents([.year, .month, .day], from: day)
+            let dir = root.appendingPathComponent(String(format: "%04d/%02d/%02d", c.year!, c.month!, c.day!))
+            if let f = (try? fm.contentsOfDirectory(atPath: dir.path))?.first(where: { $0.hasSuffix("\(sessionId).jsonl") }) {
+                return dir.appendingPathComponent(f)
+            }
+        }
+        return nil
     }
 
     /// Приложение Codex после каждого ответа запускает служебный тред (заголовки, подсказки)

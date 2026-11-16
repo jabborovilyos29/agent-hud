@@ -16,11 +16,21 @@ struct PermissionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
-                Text("Просит разрешение: \(toolTitle)").font(.system(size: 12, weight: .semibold))
-                Spacer()
-                Countdown(deadline: request.deadline)
+            if request.autoReview {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.shield").foregroundStyle(Color.accentColor)
+                    Text("Codex проверяет запрос сам: \(toolTitle)").font(.system(size: 12, weight: .semibold))
+                    Spacer()
+                }
+                Text("Включён авто-ревью: встроенный ревьюер решит сам, обычно за 15–30 с. Можно ответить раньше.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
+                    Text("Просит разрешение: \(toolTitle)").font(.system(size: 12, weight: .semibold))
+                    Spacer()
+                    Countdown(deadline: request.deadline)
+                }
             }
             ToolDetail(tool: tool, input: input, cwd: session.cwd)
             if denying {
@@ -54,7 +64,7 @@ struct PermissionView: View {
             }
         }
         .padding(10)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.09)))
+        .background(RoundedRectangle(cornerRadius: 10).fill((request.autoReview ? Color.accentColor : Color.orange).opacity(0.09)))
     }
 
     private var toolTitle: String {

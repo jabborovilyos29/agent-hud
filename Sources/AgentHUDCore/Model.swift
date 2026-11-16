@@ -172,6 +172,8 @@ public struct PendingRequest: Identifiable, Equatable, Sendable {
     public var deadline: Date
     public var status: PendingStatus
     var inputFingerprint: String
+    /// Запрос параллельно проверяет встроенный ревьюер агента (Codex auto_review) — ответ в HUD необязателен.
+    public var autoReview = false
 }
 
 /// Ответ пользователя, общий для всех агентов. Адаптер переводит его в формат своего агента.
@@ -238,12 +240,14 @@ public struct AgentSession: Identifiable, Equatable, Sendable {
         return name.isEmpty ? cwd : name
     }
 
-    /// Первый открытый запрос — его и показываем.
-    public var activePending: PendingRequest? { pending.first(where: { $0.status == .open }) }
+    /// Первый открытый запрос — его и показываем. Запросы, которые ждут пользователя, — раньше авто-проверяемых.
+    public var activePending: PendingRequest? {
+        pending.first(where: { $0.status == .open && !$0.autoReview }) ?? pending.first(where: { $0.status == .open })
+    }
     public var expiredPending: PendingRequest? { pending.first(where: { $0.status == .expired }) }
 
     public var state: AgentState {
-        if let p = activePending { return p.kind.isQuestion ? .waitingAnswer : .waitingPermission }
+        if let p = activePending, !p.autoReview { return p.kind.isQuestion ? .waitingAnswer : .waitingPermission }
         if expiredPending != nil { return .expired }
         return baseState
     }

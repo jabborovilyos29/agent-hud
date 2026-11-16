@@ -16,9 +16,14 @@ public struct SessionStore: Sendable, Equatable {
         order.compactMap { sessions[$0] }.filter { !$0.hidden && $0.revealed }
     }
 
+    /// Запросы, которые ждут именно пользователя (без авто-проверяемых агентом).
     public var openRequestCount: Int {
-        sessions.values.reduce(0) { $0 + $1.pending.filter { $0.status == .open }.count }
+        sessions.values.reduce(0) { $0 + $1.pending.filter { $0.status == .open && !$0.autoReview }.count }
     }
+
+    /// Сколько ждать решения встроенного ревьюера агента, прежде чем снять запрос из HUD.
+    /// Ревьюер Codex отвечает за 15–30 с; если он отклонил команду, она не выполнится и PostToolUse не придёт.
+    public static let autoReviewLinger: TimeInterval = 90
 
     public func session(_ key: String) -> AgentSession? { sessions[key] }
 
@@ -110,7 +115,7 @@ public struct SessionStore: Sendable, Equatable {
                     startedAt: e.time, durationMs: durationMs, status: failed ? .failed : .ok,
                     agentId: e.agentId, inputFingerprint: fp))
             }
-            released += Self.resolve(&s, toolName: tool, fingerprint: fp)
+            released += Self.resolve(&s, toolName: tool, fingerprint: fp, command: Self.commandText(input))
 
         case .permissionRequested(let rid, let tool, let input, let deadline):
             s.baseState = .working
@@ -174,6 +179,9 @@ public struct SessionStore: Sendable, Equatable {
 
         case .internalSession:
             break
+
+        case .autoReviewing(let rid):
+            if let i = s.pending.firstIndex(where: { $0.id == rid }) { s.pending[i].autoReview = true }
 
         case .notification(let type, _):
             // Агент ждёт в самом терминале (например, после «ответить в терминале» или ExitPlanMode).
@@ -280,17 +288,50 @@ public struct SessionStore: Sendable, Equatable {
     }
 
     /// Инструмент выполнился — снять запрос, который относился к нему.
-    private static func resolve(_ s: inout AgentSession, toolName: String, fingerprint fp: String) -> [String] {
+    private static func resolve(_ s: inout AgentSession, toolName: String, fingerprint fp: String, command fpCommand: String? = nil) -> [String] {
         if s.baseState == .waitingPermission { s.baseState = .working }
         let match: (PendingRequest) -> Bool = { p in
             switch p.kind {
             case .question: return toolName == "AskUserQuestion"
-            case .permission(let t, _): return p.inputFingerprint == fp || t == toolName
+            case .permission(let t, let input):
+                if p.inputFingerprint == fp { return true }
+                // У команд сверяем саму команду: агент может добавить в запрос описание
+                // (Codex), а параллельно выполняются другие команды того же инструмента.
+                if let want = Self.commandText(input), let got = fpCommand { return want == got }
+                return t == toolName
             }
         }
         guard let i = s.pending.firstIndex(where: match) else { return [] }
         let p = s.pending.remove(at: i)
         return p.status == .open ? [p.id] : []
+    }
+
+    /// Текст команды из входа инструмента (Bash у Claude, exec_command у Codex).
+    static func commandText(_ input: JSONValue) -> String? {
+        if let c = input["command"]?.stringValue ?? input["cmd"]?.stringValue {
+            return c.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let parts = input["command"]?.arrayValue?.compactMap(\.stringValue), !parts.isEmpty {
+            // ["/bin/zsh", "-lc", "команда"] → «команда»
+            return (parts.count >= 3 && parts[1].hasPrefix("-") ? parts[2] : parts.joined(separator: " "))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    /// Авто-проверяемые запросы, которые висят дольше `autoReviewLinger`: ревьюер их уже решил
+    /// (скорее всего отклонил). Убираем из HUD и отпускаем хук.
+    public mutating func dropStaleAutoReviews(now: Date) -> [String] {
+        var released: [String] = []
+        for key in order {
+            guard var s = sessions[key] else { continue }
+            let stale = s.pending.filter { $0.autoReview && $0.status == .open && now.timeIntervalSince($0.createdAt) > Self.autoReviewLinger }
+            guard !stale.isEmpty else { continue }
+            s.pending.removeAll { p in stale.contains { $0.id == p.id } }
+            released += stale.map(\.id)
+            sessions[key] = s
+        }
+        return released
     }
 
     /// Инструмент «спросить пользователя в приложении» (Codex: request_user_input, request_user_input_async).

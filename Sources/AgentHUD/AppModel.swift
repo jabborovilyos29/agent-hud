@@ -114,12 +114,16 @@ final class AppModel: ObservableObject {
         let now = Date()
         for e in adapter.events(from: m, now: now) {
             let released = store.apply(e, adapter: adapter)
-            let event = m.payload["hook_event_name"]?.stringValue ?? m.mode.rawValue
+            var event = m.payload["hook_event_name"]?.stringValue ?? m.mode.rawValue
+            if case .autoReviewing = e.body { event = "auto_review" }
             let state = store.session(e.sessionKey)?.state.rawValue ?? "-"
             hudLog.notice("\(m.agent.rawValue, privacy: .public) \(event, privacy: .public) → \(state, privacy: .public) [\(e.sessionId.prefix(8), privacy: .public)]")
             release(released)
-            if case .permissionRequested = e.body { requestArrived(e.sessionKey) }
-            if case .questionAsked = e.body { requestArrived(e.sessionKey) }
+        }
+        // После всех событий: запрос мог оказаться авто-проверяемым (Codex auto_review) — тогда не открываем окошко.
+        if m.mode.isSync, let s = store.session(forRequest: m.requestId),
+           let p = s.pending.first(where: { $0.id == m.requestId }), !p.autoReview {
+            requestArrived(s.id)
         }
         if let k = selectedKey, store.session(k) == nil || store.session(k)?.hidden == true { selectedKey = nil }
     }
@@ -153,12 +157,13 @@ final class AppModel: ObservableObject {
                 released += next.markEnded(s.id, now: now)
             }
         }
+        released += next.dropStaleAutoReviews(now: now)
         if next != store { store = next }
         release(released)
         if let k = selectedKey, store.session(k) == nil || store.session(k)?.hidden == true { selectedKey = nil }
         // Уведомление, если запрос висит дольше 10 с, а HUD не виден.
         for s in store.sessions.values {
-            guard let p = s.activePending, !notified.contains(p.id), now.timeIntervalSince(p.createdAt) > 10 else { continue }
+            guard let p = s.activePending, !p.autoReview, !notified.contains(p.id), now.timeIntervalSince(p.createdAt) > 10 else { continue }
             notified.insert(p.id)
             onRequestNeedsAttention?(s)
         }

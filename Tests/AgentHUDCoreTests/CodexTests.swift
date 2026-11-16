@@ -167,3 +167,107 @@ func codexFixture(_ name: String) throws -> JSONValue {
         #expect(st.session("codex:t1")?.state == .ended)
     }
 }
+
+/// Codex с `approvals_reviewer = auto_review`: запросы решает встроенный ревьюер, хук он не ждёт.
+@Suite struct CodexAutoReviewTests {
+    let codex = CodexAdapter()
+    let app = HostInfo(agentPid: 1, appBundleId: HostInfo.codexDesktop, appName: "Codex")
+
+    func makeRollout(_ reviewers: [String]) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ahud-rollout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let f = dir.appendingPathComponent("rollout-2026-11-16T11-53-52-th1.jsonl")
+        var lines = [#"{"type":"session_meta","payload":{"id":"th1"}}"#]
+        for r in reviewers {
+            lines.append(#"{"type":"turn_context","payload":{"approval_policy":"on-request","approvals_reviewer":"\#(r)"}}"#)
+            lines.append(#"{"type":"response_item","payload":{"type":"message","text":"…"}}"#)
+        }
+        try lines.joined(separator: "\n").write(to: f, atomically: true, encoding: .utf8)
+        return f
+    }
+
+    func ev(_ name: String, _ extra: JSONValue, mode: HookMode = .event, rid: String = "r", at t: Double, rollout: URL) -> [AgentEvent] {
+        var p: JSONValue = ["session_id": "th1", "cwd": "/p", "hook_event_name": .string(name), "transcript_path": .string(rollout.path)]
+        for e in extra.objectValue?.entries ?? [] { p[e.key] = e.value }
+        return codex.events(from: HookMessage(agent: .codex, mode: mode, requestId: rid, deadline: t0.addingTimeInterval(600),
+                                              host: app, payload: p), now: t0.addingTimeInterval(t))
+    }
+
+    @Test func reviewerIsReadFromRolloutLastValueWins() throws {
+        #expect(CodexAdapter.approvalsReviewer(sessionId: "th1", transcriptPath: try makeRollout(["auto_review"]).path) == "auto_review")
+        #expect(CodexAdapter.approvalsReviewer(sessionId: "th1", transcriptPath: try makeRollout(["auto_review", "user"]).path) == "user")
+        #expect(CodexAdapter.approvalsReviewer(sessionId: "th1", transcriptPath: "/nonexistent", sessionsRoot: URL(fileURLWithPath: "/nonexistent")) == nil)
+    }
+
+    @Test func rolloutIsFoundBySessionIdWithoutTranscriptPath() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ahud-sessions-\(UUID().uuidString)")
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: t0)
+        let dir = root.appendingPathComponent(String(format: "%04d/%02d/%02d", c.year!, c.month!, c.day!))
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try #"{"payload":{"approvals_reviewer":"auto_review"}}"#.write(to: dir.appendingPathComponent("rollout-x-0123456789ab.jsonl"), atomically: true, encoding: .utf8)
+        #expect(CodexAdapter.approvalsReviewer(sessionId: "0123456789ab", transcriptPath: nil, sessionsRoot: root, now: t0) == "auto_review")
+    }
+
+    @Test func autoReviewedRequestDoesNotWaitForUser() throws {
+        let rollout = try makeRollout(["auto_review"])
+        var st = SessionStore()
+        func run(_ es: [AgentEvent]) -> [String] { es.flatMap { st.apply($0, adapter: codex) } }
+        _ = run(ev("UserPromptSubmit", ["prompt": "сделай субтитры"], at: 0, rollout: rollout))
+        let cmd = "node qa/inspect-studio.cjs"
+        _ = run(ev("PermissionRequest", ["tool_name": "Bash", "tool_input": ["command": .string(cmd), "description": "Проверить Studio?"]],
+                   mode: .permission, rid: "p1", at: 1, rollout: rollout))
+        var s = try #require(st.session("codex:th1"))
+        #expect(s.activePending?.autoReview == true)
+        #expect(s.state == .working)              // не «Ждёт разрешения»
+        #expect(st.openRequestCount == 0)          // не считается ожиданием пользователя
+
+        // Параллельно выполнилась другая команда — запрос не снимается
+        var rel = run(ev("PostToolUse", ["tool_name": "Bash", "tool_use_id": "c9", "tool_input": ["command": "ls"]], at: 5, rollout: rollout))
+        #expect(rel.isEmpty)
+        #expect(st.session("codex:th1")?.activePending?.id == "p1")
+
+        // Ревьюер одобрил — выполнилась именно эта команда (уже без description)
+        rel = run(ev("PostToolUse", ["tool_name": "Bash", "tool_use_id": "c1", "tool_input": ["command": .string(cmd)]], at: 30, rollout: rollout))
+        #expect(rel == ["p1"])
+        s = try #require(st.session("codex:th1"))
+        #expect(s.activePending == nil)
+    }
+
+    @Test func rejectedByReviewerIsDroppedAfterLinger() throws {
+        let rollout = try makeRollout(["auto_review"])
+        var st = SessionStore()
+        for e in ev("PermissionRequest", ["tool_name": "Bash", "tool_input": ["command": "rm -rf /tmp/x"]], mode: .permission, rid: "p2", at: 0, rollout: rollout) {
+            st.apply(e, adapter: codex)
+        }
+        #expect(st.dropStaleAutoReviews(now: t0.addingTimeInterval(60)).isEmpty)
+        #expect(st.dropStaleAutoReviews(now: t0.addingTimeInterval(91)) == ["p2"])
+        #expect(st.session("codex:th1")?.pending.isEmpty == true)
+    }
+
+    @Test func userReviewerStillWaitsForUser() throws {
+        let rollout = try makeRollout(["user"])
+        var st = SessionStore()
+        for e in ev("PermissionRequest", ["tool_name": "Bash", "tool_input": ["command": "npm publish"]], mode: .permission, rid: "p3", at: 0, rollout: rollout) {
+            st.apply(e, adapter: codex)
+        }
+        #expect(st.session("codex:th1")?.state == .waitingPermission)
+        #expect(st.openRequestCount == 1)
+    }
+}
+
+/// Параллельные команды одного инструмента не должны снимать чужой запрос.
+@Suite struct PendingMatchingTests {
+    @Test func claudeParallelBashDoesNotResolveOtherRequest() throws {
+        var st = SessionStore()
+        let a = ClaudeCodeAdapter()
+        func pay(_ name: String, _ cmd: String) -> JSONValue {
+            ["session_id": "s1", "cwd": "/p", "hook_event_name": .string(name), "tool_name": "Bash", "tool_use_id": .string(cmd),
+             "tool_input": ["command": .string(cmd)]]
+        }
+        for e in a.events(from: HookMessage(agent: .claude, mode: .permission, requestId: "p1", deadline: t0.addingTimeInterval(600), host: HostInfo(), payload: pay("PermissionRequest", "npm publish")), now: t0) { st.apply(e) }
+        var rel = a.events(from: HookMessage(agent: .claude, mode: .event, requestId: "e", deadline: nil, host: HostInfo(), payload: pay("PostToolUse", "ls")), now: t0).flatMap { st.apply($0) }
+        #expect(rel.isEmpty)
+        rel = a.events(from: HookMessage(agent: .claude, mode: .event, requestId: "e", deadline: nil, host: HostInfo(), payload: pay("PostToolUse", "npm publish")), now: t0).flatMap { st.apply($0) }
+        #expect(rel == ["p1"])
+    }
+}
