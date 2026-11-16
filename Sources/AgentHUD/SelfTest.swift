@@ -1,0 +1,243 @@
+import AgentHUDCore
+import AppKit
+import Foundation
+
+/// `AgentHUD --selftest <папка с фикстурами>`: настоящий сокет-сервер и AppModel
+/// против настоящего `agenthud-hook`, решения принимаются программно вместо кликов.
+@MainActor
+enum SelfTest {
+    static var failures = 0
+
+    static func check(_ name: String, _ ok: Bool, _ detail: @autoclosure () -> String = "") {
+        print((ok ? "  ok   " : "  FAIL ") + name + (ok ? "" : "  → \(detail())"))
+        if !ok { failures += 1 }
+    }
+
+    static func run(fixtures: URL) -> Int32 {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ahud-\(getpid())")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let sock = "/tmp/ahud-selftest-\(getpid()).sock"   // путь сокета ограничен 104 байтами
+        setenv("AGENTHUD_SUPPORT_DIR", dir.path, 1)       // журнал решений — во временную папку
+        defer { try? FileManager.default.removeItem(at: dir); unlink(sock) }
+
+        let model = AppModel(settings: Settings())
+        do { try model.start(socketPath: sock) } catch { print("не стартовал сервер: \(error)"); return 1 }
+        guard let hook = HookSetup.bundledHook() else { print("нет agenthud-hook рядом с приложением"); return 1 }
+
+        func fixture(_ n: String, _ agent: String) -> Data {
+            let dir = agent == "claude" ? fixtures : fixtures.deletingLastPathComponent().appendingPathComponent(agent)
+            return (try? Data(contentsOf: dir.appendingPathComponent(n + ".json"))) ?? Data()
+        }
+
+        /// Запустить хук в фоне; вернуть процесс и пайп stdout.
+        func spawn(_ mode: String, _ fx: String, timeout: Int = 600, agent: String = "claude") -> (Process, Pipe) {
+            let p = Process()
+            p.executableURL = hook
+            p.arguments = [agent, mode] + (mode == "event" ? [] : ["--timeout", "\(timeout)"])
+            var env = ProcessInfo.processInfo.environment
+            env["AGENTHUD_SOCKET"] = sock
+            env["AGENTHUD_ANY_HOST"] = "1"
+            p.environment = env
+            let inp = Pipe(), out = Pipe()
+            p.standardInput = inp
+            p.standardOutput = out
+            try? p.run()
+            inp.fileHandleForWriting.write(fixture(fx, agent))
+            try? inp.fileHandleForWriting.close()
+            return (p, out)
+        }
+
+        func pump(_ seconds: Double, until: () -> Bool = { false }) {
+            let end = Date().addingTimeInterval(seconds)
+            while Date() < end, !until() { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        }
+
+        func finish(_ p: Process, _ out: Pipe) -> String {
+            pump(5) { !p.isRunning }
+            return String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        }
+
+        let key = "claude:11111111-2222-3333-4444-555555555555"
+
+        print("События доходят до модели")
+        for fx in ["SessionStart", "UserPromptSubmit", "PreToolUse-Bash"] {
+            let (p, _) = spawn("event", fx); p.waitUntilExit()
+        }
+        pump(2) { model.store.session(key)?.steps.isEmpty == false }
+        let s = model.store.session(key)
+        check("сессия создана", s != nil)
+        check("заголовок из промпта", s?.title.hasPrefix("First use") == true, s?.title ?? "nil")
+        check("шаг Bash в ленте", s?.steps.first?.toolName == "Bash", "\(s?.steps ?? [])")
+        check("TTY агента определён", s?.host.tty != nil || s?.host.agentPid != nil, "\(s?.host as Any)")
+
+        print("Разрешить из HUD")
+        var (p, out) = spawn("permission", "permission-PermissionRequest")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        check("окошко открылось", model.store.session(key)?.state == .waitingPermission)
+        check("карточка выбрана автоматически", model.selectedKey == key)
+        if let rid = model.store.session(key)?.activePending?.id { model.decide(rid, .allow) }
+        var o = finish(p, out)
+        check("хук вернул allow", o.contains("\"behavior\":\"allow\""), o)
+        check("окошко закрылось", model.store.session(key)?.activePending == nil)
+
+        print("Отклонить с причиной")
+        (p, out) = spawn("permission", "permission-PermissionRequest")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        if let rid = model.store.session(key)?.activePending?.id { model.decide(rid, .deny(reason: "не сейчас")) }
+        o = finish(p, out)
+        check("хук вернул deny + причину", o.contains("\"behavior\":\"deny\"") && o.contains("не сейчас"), o)
+
+        print("Ответ на вопрос")
+        (p, out) = spawn("question", "question-PreToolUse-AskUserQuestion")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        if let pend = model.store.session(key)?.activePending, case .question(let qs, _) = pend.kind {
+            check("ждёт ответа", model.store.session(key)?.state == .waitingAnswer)
+            model.decide(pend.id, .answer([qs[0].question: "Green, Blue"]))
+        } else { check("вопрос пришёл", false) }
+        o = finish(p, out)
+        check("answers в updatedInput", o.contains("\"answers\"") && o.contains("Green, Blue"), o)
+
+        print("Ответили в терминале → PostToolUse снимает окошко и отпускает хук")
+        (p, out) = spawn("permission", "permission-PermissionRequest")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        let (p2, _) = spawn("event", "PostToolUse-Bash"); p2.waitUntilExit()
+        o = finish(p, out)
+        check("хук отпущен с пустым выводом", !p.isRunning && o.isEmpty, "running=\(p.isRunning) out=\(o)")
+        check("окошко снято", model.store.session(key)?.activePending == nil)
+
+        print("Агент убил хук → окошко снимается")
+        (p, out) = spawn("permission", "permission-PermissionRequest")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        p.terminate()
+        pump(3) { model.store.session(key)?.activePending == nil }
+        check("окошко снято", model.store.session(key)?.activePending == nil)
+
+        print("Просрочка")
+        (p, out) = spawn("permission", "permission-PermissionRequest", timeout: 7)
+        o = finish(p, out)
+        pump(2) { model.store.session(key)?.state == .expired }
+        check("хук ушёл сам и молча", !p.isRunning && o.isEmpty, o)
+        check("в HUD «Просрочено»", model.store.session(key)?.state == .expired, "\(model.store.session(key)?.state as Any)")
+        let (p3, _) = spawn("event", "Stop"); p3.waitUntilExit()
+        pump(2) { model.store.session(key)?.state == .done }
+        check("Stop → «Готово», просрочка убрана", model.store.session(key)?.state == .done && model.store.session(key)?.expiredPending == nil)
+
+        print("Codex: события и разрешение")
+        let ckey = "codex:cdx-1111"
+        for fx in ["SessionStart", "UserPromptSubmit", "PreToolUse-apply_patch"] {
+            let (p, _) = spawn("event", fx, agent: "codex"); p.waitUntilExit()
+        }
+        pump(2) { model.store.session(ckey)?.steps.isEmpty == false }
+        check("сессия Codex создана", model.store.session(ckey)?.kind == .codex)
+        check("шаг патча в ленте", model.store.session(ckey)?.steps.first?.summary.hasPrefix("Patch") == true,
+              model.store.session(ckey)?.steps.first?.summary ?? "nil")
+        (p, out) = spawn("permission", "permission-PermissionRequest", agent: "codex")
+        pump(3) { model.store.session(ckey)?.activePending != nil }
+        if let rid = model.store.session(ckey)?.activePending?.id { model.decide(rid, .allow) }
+        o = finish(p, out)
+        check("Codex получил allow без updatedInput", o.contains("\"behavior\":\"allow\"") && !o.contains("updatedInput"), o)
+        let (p4, _) = spawn("event", "Interrupt", agent: "codex"); p4.waitUntilExit()
+        pump(2) { model.store.session(ckey)?.state == .idle }
+        check("Interrupt → «ждёт задачу»", model.store.session(ckey)?.state == .idle)
+
+        print("Выход приложения отпускает висящие хуки")
+        (p, out) = spawn("question", "question-PreToolUse-AskUserQuestion")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        model.stop()
+        o = finish(p, out)
+        check("хук отпущен", !p.isRunning && o.isEmpty, o)
+
+        print()
+        print("ИТОГ:", failures == 0 ? "все проверки прошли" : "провалов: \(failures)")
+        return failures == 0 ? 0 : 1
+    }
+}
+
+/// `AgentHUD --uitest`: настоящая панель HUD с демо-сессиями, синтетические клики и клавиши.
+@MainActor
+enum UITest {
+    static func run() -> Int32 {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: @autoclosure () -> String = "") {
+            print((ok ? "  ok   " : "  FAIL ") + name + (ok ? "" : "  → \(detail())"))
+            if !ok { failures += 1 }
+        }
+        func pump(_ s: Double) { RunLoop.main.run(until: Date().addingTimeInterval(s)) }
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ahud-ui-\(getpid())")
+        setenv("AGENTHUD_SUPPORT_DIR", dir.path, 1)       // журнал решений — во временную папку
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let model = AppModel(settings: Settings())
+        Demo.populate(model)
+        let hud = HUDController(model: model)
+        hud.updateVisibility()
+        pump(1.0)
+        let panel = hud.panel
+        check("панель показана", panel.isVisible)
+        let h = panel.frame.height, w = panel.frame.width
+        check("панель в правом верхнем углу", (NSScreen.main.map { abs(panel.frame.maxX - $0.visibleFrame.maxX) < 20 } ?? false),
+              "\(panel.frame)")
+
+        func click(_ p: NSPoint) {
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                if let e = NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                              windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
+                    panel.sendEvent(e)
+                }
+                pump(0.05)
+            }
+        }
+
+        print("Клик по персонажу открывает окошко")
+        // Самый правый персонаж: отступ 14 + 8 по краю, персонаж 40 pt; ряд сверху.
+        let rowY = h - (14 + 6 + 20)
+        click(NSPoint(x: w - (14 + 8 + 20), y: rowY))
+        pump(0.6)
+        let first = model.selectedKey
+        check("окошко открылось", first != nil, "selectedKey=nil")
+        check("панель выросла под окошко", panel.frame.height > h + 100, "\(panel.frame.height)")
+
+        print("Повторный клик закрывает")
+        let h2 = panel.frame.height
+        click(NSPoint(x: panel.frame.width - (14 + 8 + 20), y: h2 - (14 + 6 + 20)))
+        pump(0.6)
+        check("окошко закрылось", model.selectedKey == nil, "\(model.selectedKey ?? "")")
+
+        print("⌘↩ разрешает запрос в открытом окошке")
+        model.selectedKey = "claude:demo-a"
+        model.selectedByUser = true
+        pump(0.6)
+        panel.makeKey()
+        pump(0.2)
+        if let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: ProcessInfo.processInfo.systemUptime,
+                                    windowNumber: panel.windowNumber, context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
+                                    isARepeat: false, keyCode: 36) {
+            _ = panel.performKeyEquivalent(with: e)
+        }
+        pump(0.5)
+        check("запрос demo-a снят", model.store.session("claude:demo-a")?.activePending == nil,
+              "\(model.store.session("claude:demo-a")?.state as Any)")
+
+        print("Скрытие сессии")
+        model.hide("codex:demo-d")
+        pump(0.4)
+        check("сессия скрыта", !model.visibleSessions.contains { $0.id == "codex:demo-d" })
+
+        print("Панель в строке меню")
+        let menu = StatusMenu(model: model, hud: hud)
+        menu.show()
+        pump(0.6)
+        check("поповер открыт", menu.isShown)
+        let screenH = NSScreen.main?.visibleFrame.height ?? 900
+        check("помещается по высоте", menu.shownSize.height > 300 && menu.shownSize.height < screenH,
+              "\(menu.shownSize) при экране \(screenH)")
+        menu.close()
+        pump(0.4)
+        check("поповер закрыт", !menu.isShown, "isShown=\(menu.isShown) окно видно=\(menu.windowVisible)")
+
+        panel.orderOut(nil)
+        print()
+        print("ИТОГ:", failures == 0 ? "все проверки прошли" : "провалов: \(failures)")
+        return failures == 0 ? 0 : 1
+    }
+}

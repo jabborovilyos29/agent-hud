@@ -1,0 +1,10 @@
+{
+  "session_id": "cdx-1111",
+  "transcript_path": null,
+  "cwd": "/Users/dev/project",
+  "model": "gpt-5.5-codex",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "turn_id": "t1",
+  "prompt": "Почини тесты в проекте"
+}

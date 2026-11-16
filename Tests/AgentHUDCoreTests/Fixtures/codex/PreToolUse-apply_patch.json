@@ -1,0 +1,14 @@
+{
+  "session_id": "cdx-1111",
+  "transcript_path": null,
+  "cwd": "/Users/dev/project",
+  "model": "gpt-5.5-codex",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "turn_id": "t1",
+  "tool_name": "apply_patch",
+  "tool_use_id": "call_2",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Update File: /Users/dev/project/src/a.ts\n@@\n-x\n+y\n*** Add File: docs/b.md\n+hi\n*** End Patch"
+  }
+}

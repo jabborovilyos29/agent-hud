@@ -1,0 +1,11 @@
+{
+  "session_id": "cdx-1111",
+  "transcript_path": null,
+  "cwd": "/Users/dev/project",
+  "model": "gpt-5.5-codex",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "turn_id": "t1",
+  "stop_hook_active": false,
+  "last_assistant_message": "Тесты починены."
+}
