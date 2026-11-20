@@ -178,6 +178,22 @@ enum Previews {
             snapshot(HUDRootView(model: model).environment(\.solidBackground, true), dark: scheme == "dark",
                      to: dir.appendingPathComponent("live-\(key.replacingOccurrences(of: "claude:", with: ""))-\(scheme).png"))
         }
+        // Огромный ввод (как длинный скрипт Workflow): подробности прокручиваются, кнопки на месте.
+        let huge = (1...400).map { "  step\($0): agent('проверить гипотезу номер \($0) и вернуть находки', {schema: FINDINGS})," }
+            .joined(separator: "\n")
+        model.inject([
+            AgentEvent(kind: .claude, sessionId: "demo-big", cwd: "/Users/dev/acme-hub", host: Demo.vscodeHost, time: Date(),
+                       body: .promptSubmitted("Найди причины мерцания")),
+            AgentEvent(kind: .claude, sessionId: "demo-big", cwd: "/Users/dev/acme-hub", host: Demo.vscodeHost, time: Date(),
+                       body: .permissionRequested(requestId: "big-1", toolName: "Workflow",
+                                                  input: ["script": .string("export const meta = {\n" + huge + "\n}"),
+                                                          "args": ["mode": "diagnose", "lenses": 5]],
+                                                  deadline: Date().addingTimeInterval(540), suggestions: [])),
+        ])
+        model.selectedKey = "claude:demo-big"
+        snapshot(HUDRootView(model: model).environment(\.solidBackground, true), dark: false,
+                 to: dir.appendingPathComponent("live-big-light.png"))
+        model.hide("claude:demo-big")
         // Панель в строке меню, светлая и тёмная.
         for dark in [false, true] {
             for tab in [0, 1] {

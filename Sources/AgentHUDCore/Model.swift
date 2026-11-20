@@ -211,6 +211,8 @@ public struct PendingRequest: Identifiable, Equatable, Sendable {
     public var autoReview = false
     /// Подсказки агента «разрешать и дальше» (`permission_suggestions` у Claude Code) — как есть.
     public var suggestions: [JSONValue] = []
+    /// Запрос пришёл изнутри субагента (`agent_id`); nil — основной агент.
+    public var agentId: String? = nil
 }
 
 /// Ответ пользователя, общий для всех агентов. Адаптер переводит его в формат своего агента.

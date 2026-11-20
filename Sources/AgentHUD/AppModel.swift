@@ -39,10 +39,12 @@ final class Settings: ObservableObject {
     @Published var activityLog: Bool { didSet { d.set(activityLog, forKey: "activityLog") } }
     /// Быстрые промпты для сессий в VS Code (вставляются в поле ввода сессии).
     @Published var quickPrompts: [String] { didSet { d.set(quickPrompts, forKey: "quickPrompts") } }
+    /// HUD прижат к левому краю экрана: якорь — левый верхний угол, окошко раскрывается вправо.
+    @Published var anchorLeft: Bool { didSet { d.set(anchorLeft, forKey: "anchorLeft") } }
 
     static let defaultQuickPrompts = ["Продолжай", "Прогони тесты и почини, что упало", "Проверь линтер и типы", "Сделай коммит"]
 
-    /// Правый верхний угол HUD в координатах экрана; nil — по умолчанию.
+    /// Верхний угол HUD в координатах экрана (правый, а при `anchorLeft` — левый); nil — по умолчанию.
     var anchor: CGPoint? {
         get {
             guard d.object(forKey: "anchorX") != nil else { return nil }
@@ -72,6 +74,7 @@ final class Settings: ObservableObject {
         projectLabels = d.object(forKey: "projectLabels") as? Bool ?? true
         activityLog = d.object(forKey: "activityLog") as? Bool ?? true
         quickPrompts = (d.stringArray(forKey: "quickPrompts") ?? Self.defaultQuickPrompts).filter { !$0.isEmpty }
+        anchorLeft = d.bool(forKey: "anchorLeft")
     }
 }
 
@@ -91,6 +94,12 @@ final class AppModel: ObservableObject {
     var onRequestNeedsAttention: ((AgentSession) -> Void)?
     /// Открыть окно «Карта агентов» (его держит AppDelegate).
     var onOpenMap: (() -> Void)?
+    /// Все папки проектов, встреченные за время работы, плюс открытые окна VS Code. Метки проектов
+    /// считаются по этому набору, а не по видимым сейчас сессиям — иначе метки менялись бы
+    /// каждый раз, когда сессия появляется или пропадает.
+    private var knownProjects = Set<String>()
+    private var editorFolders = Set<String>()
+    private var editorFoldersReadAt = Date.distantPast
 
     init(settings: Settings) {
         self.settings = settings
@@ -125,28 +134,56 @@ final class AppModel: ObservableObject {
     func handle(_ m: HookMessage) {
         let adapter = Adapters.adapter(for: m.agent)
         let now = Date()
+        // Все события сообщения применяем к копии и публикуем один раз: каждая публикация — перерисовка HUD.
+        var next = store
+        var released: [String] = []
         for e in adapter.events(from: m, now: now) {
-            let released = store.apply(e, adapter: adapter)
-            logActivity(e)
+            released += next.apply(e, adapter: adapter)
+            logActivity(e, session: next.session(e.sessionKey))
             var event = m.payload["hook_event_name"]?.stringValue ?? m.mode.rawValue
             if case .autoReviewing = e.body { event = "auto_review" }
-            let state = store.session(e.sessionKey)?.state.rawValue ?? "-"
+            let state = next.session(e.sessionKey)?.state.rawValue ?? "-"
             hudLog.notice("\(m.agent.rawValue, privacy: .public) \(event, privacy: .public) → \(state, privacy: .public) [\(e.sessionId.prefix(8), privacy: .public)]")
-            release(released)
         }
+        if next != store { store = next }
+        release(released)
+        rememberProjects(now: now)
         // После всех событий: запрос мог оказаться авто-проверяемым (Codex auto_review) — тогда не открываем окошко.
         if m.mode.isSync, let s = store.session(forRequest: m.requestId),
            let p = s.pending.first(where: { $0.id == m.requestId }), !p.autoReview {
             requestArrived(s.id)
         }
         if let k = selectedKey, store.session(k) == nil || store.session(k)?.hidden == true { selectedKey = nil }
+        scheduleAutoClose()
+    }
+
+    /// Окошко, которое открылось само на запрос, закрывается, когда запрос решён (в HUD, в VS Code или в терминале).
+    /// С паузой: если агент сразу спросит следующее, окошко не мигает закрытием-открытием.
+    private var autoCloseTask: Task<Void, Never>?
+    static let autoCloseDelay: Duration = .seconds(1)
+
+    private func autoOpenedCardIsIdle() -> Bool {
+        guard let k = selectedKey, !selectedByUser, let s = store.session(k) else { return false }
+        return s.activePending == nil && s.expiredPending == nil && !s.state.needsUser
+    }
+
+    private func scheduleAutoClose() {
+        guard autoOpenedCardIsIdle() else { autoCloseTask?.cancel(); autoCloseTask = nil; return }
+        guard autoCloseTask == nil else { return }
+        autoCloseTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.autoCloseDelay)
+            guard let self, !Task.isCancelled else { return }
+            self.autoCloseTask = nil
+            if self.autoOpenedCardIsIdle() { self.selectedKey = nil }
+        }
     }
 
     /// Промпт и конец хода — в журнал активности (для сводки за день и вкладки «Сегодня»).
-    private func logActivity(_ e: AgentEvent) {
-        guard settings.activityLog, let s = store.session(e.sessionKey), e.agentId == nil else { return }
+    private func logActivity(_ e: AgentEvent, session: AgentSession?) {
+        guard settings.activityLog, let s = session, e.agentId == nil else { return }
         switch e.body {
         case .promptSubmitted(let text):
+            guard !SessionStore.isInjectedPrompt(text) else { return }
             ActivityLog.append(ActivityRecord(kind: .prompt, time: e.time, agent: s.kind.rawValue, session: s.sessionId,
                                               project: s.projectName, cwd: s.cwd, text: String(text.prefix(600))))
         case .stopped(let msg, let failed):
@@ -160,7 +197,9 @@ final class AppModel: ObservableObject {
 
     private func requestArrived(_ key: String) {
         if settings.openCardOnRequest, selectedKey == nil || store.session(selectedKey!)?.activePending == nil {
-            selectedKey = key
+            autoCloseTask?.cancel()
+            autoCloseTask = nil
+            if selectedKey != key { selectedKey = key }
             selectedByUser = false
         }
     }
@@ -190,7 +229,9 @@ final class AppModel: ObservableObject {
         released += next.dropStaleAutoReviews(now: now)
         if next != store { store = next }
         release(released)
+        rememberProjects(now: now)
         if let k = selectedKey, store.session(k) == nil || store.session(k)?.hidden == true { selectedKey = nil }
+        scheduleAutoClose()
         // Уведомление, если запрос висит дольше 10 с, а HUD не виден.
         for s in store.sessions.values {
             guard let p = s.activePending, !p.autoReview, !notified.contains(p.id), now.timeIntervalSince(p.createdAt) > 10 else { continue }
@@ -213,7 +254,13 @@ final class AppModel: ObservableObject {
                                               text: DecisionLog.describe(session: s, request: p), detail: decision.logLabel))
         }
         if case .passthrough = decision { TerminalFocus.focus(s) }
-        if selectedKey == s.id, !selectedByUser, store.session(s.id)?.activePending == nil { selectedKey = nil }
+        // Ждёт ещё кто-то — показываем его запрос сразу; иначе окошко, открытое самим запросом, закроется с паузой.
+        if selectedKey == s.id, store.session(s.id)?.activePending == nil,
+           let other = store.visibleSessions.first(where: { $0.id != s.id && $0.activePending.map { !$0.autoReview } == true }) {
+            selectedKey = other.id
+            selectedByUser = false
+        }
+        scheduleAutoClose()
     }
 
     func select(_ key: String?) {
@@ -244,9 +291,20 @@ final class AppModel: ObservableObject {
         TerminalFocus.focusEditor(s, prompt: text)
     }
 
-    /// Короткие метки проектов для видимых сессий («mobile», «web»…).
+    /// Короткие метки проектов для видимых сессий («mobile», «web»…), устойчивые к приходу и уходу сессий.
     var projectShortLabels: [String: String] {
-        ProjectNames.shortLabels(for: store.visibleSessions.map(\.cwd))
+        let visible = store.visibleSessions.map(\.cwd)
+        let universe = knownProjects.union(editorFolders).union(visible)
+        let all = ProjectNames.shortLabels(for: Array(universe))
+        return all.filter { visible.contains($0.key) }
+    }
+
+    /// Запомнить папки сессий и раз в полминуты перечитать окна VS Code (для меток проектов).
+    private func rememberProjects(now: Date) {
+        for s in store.sessions.values where !s.cwd.isEmpty { knownProjects.insert(s.cwd) }
+        guard now.timeIntervalSince(editorFoldersReadAt) > 30 else { return }
+        editorFoldersReadAt = now
+        editorFolders = EditorWorkspaces.openFolders()
     }
 
     func openMap() { onOpenMap?() }
@@ -264,7 +322,10 @@ final class AppModel: ObservableObject {
     // MARK: - Для демо и превью
 
     func inject(_ events: [AgentEvent]) {
-        for e in events { store.apply(e) }
+        var next = store
+        for e in events { next.apply(e) }
+        store = next
+        rememberProjects(now: Date())
     }
 
     var visibleSessions: [AgentSession] { store.visibleSessions }

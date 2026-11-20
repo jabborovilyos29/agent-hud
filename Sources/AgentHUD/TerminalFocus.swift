@@ -194,3 +194,18 @@ enum EditorWorkspaces {
         return best
     }
 }
+
+extension EditorWorkspaces {
+    /// Все папки, открытые сейчас в окнах VS Code с расширением Claude Code (живые `pid`).
+    static func openFolders() -> Set<String> {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/ide")
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return [] }
+        var out = Set<String>()
+        for f in files where f.pathExtension == "lock" {
+            guard let data = try? Data(contentsOf: f), let v = try? JSONValue.parse(data) else { continue }
+            if let pid = v["pid"]?.intValue, !HostProbe.isAlive(Int32(pid)) { continue }
+            for folder in v["workspaceFolders"]?.arrayValue?.compactMap(\.stringValue) ?? [] { out.insert(folder) }
+        }
+        return out
+    }
+}

@@ -28,36 +28,45 @@ public enum ProjectNames {
             .map(String.init)
     }
 
-    /// Короткие метки для набора проектов: общий для всех префикс отбрасывается
-    /// («acme-mobile-app», «acme-web-client» → «mobile», «web»), совпадения уточняются следующим словом.
-    public static func shortLabels(for cwds: [String], maxLength: Int = 9) -> [String: String] {
+    /// Короткие метки для набора проектов. Первое слово, общее для нескольких проектов («acme-mobile-app»,
+    /// «acme-web-client»), у них отбрасывается → «mobile», «web»; совпадения уточняются следующим словом
+    /// («hrm-front», «hrm-v2»). Проект без «родни» сохраняет полное имя: «agent-hub», а не «agent».
+    /// Набор лучше передавать устойчивый (все известные проекты), тогда метки не меняются,
+    /// когда сессии приходят и уходят.
+    public static func shortLabels(for cwds: [String], maxLength: Int = 10) -> [String: String] {
         let unique = Array(Set(cwds.filter { !$0.isEmpty })).sorted()
         var names: [String: [String]] = [:]
         for c in unique {
             let t = tokens(displayName(cwd: c))
             names[c] = t.isEmpty ? [displayName(cwd: c).lowercased()] : t
         }
-        guard unique.count > 1 else {
-            return Dictionary(uniqueKeysWithValues: unique.map { ($0, clip(names[$0]!.joined(separator: "-"), maxLength)) })
+        var firstCount: [String: Int] = [:]
+        for t in names.values where t.count > 1 { firstCount[t[0], default: 0] += 1 }
+        var parts: [String: [String]] = [:]
+        var taken: [String: Int] = [:]
+        for c in unique {
+            let t = names[c]!
+            if t.count > 1, firstCount[t[0], default: 0] >= 2 {
+                parts[c] = Array(t.dropFirst())
+                taken[c] = 1
+            } else {
+                parts[c] = t
+                taken[c] = t.count
+            }
         }
-        // Общий префикс из целых слов, но у каждого имени остаётся хотя бы одно слово.
-        while let first = names.values.first?.first,
-              names.values.allSatisfy({ $0.count > 1 && $0.first == first }) {
-            for k in names.keys { names[k]!.removeFirst() }
-        }
-        var taken = Array(repeating: 1, count: unique.count)
-        func label(_ i: Int) -> String { names[unique[i]]!.prefix(taken[i]).joined(separator: "-") }
+        func label(_ c: String) -> String { parts[c]!.prefix(taken[c]!).joined(separator: "-") }
         // Уточняем, пока есть совпадения и есть чем уточнять. Совпавшие уточняются одновременно,
         // иначе первая метка уйдёт вперёд, а вторая останется короткой.
         for _ in 0..<4 {
-            let current = unique.indices.map(label)
-            let clashing = unique.indices.filter { i in
-                unique.indices.contains { $0 != i && current[$0] == current[i] } && taken[i] < names[unique[i]]!.count
+            var current: [String: String] = [:]
+            for c in unique { current[c] = label(c) }
+            let clashing = unique.filter { c in
+                unique.contains { $0 != c && current[$0] == current[c] } && taken[c]! < parts[c]!.count
             }
             if clashing.isEmpty { break }
-            for i in clashing { taken[i] += 1 }
+            for c in clashing { taken[c]! += 1 }
         }
-        return Dictionary(uniqueKeysWithValues: unique.indices.map { (unique[$0], clip(label($0), maxLength)) })
+        return Dictionary(uniqueKeysWithValues: unique.map { ($0, clip(label($0), maxLength)) })
     }
 
     static func clip(_ s: String, _ n: Int) -> String {

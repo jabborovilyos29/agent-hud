@@ -37,25 +37,42 @@ extension View {
 
 // MARK: - Корень HUD
 
+/// Плавное появление и исчезновение без анимации размеров. Пружинные анимации раскладки меняли размер
+/// содержимого на каждом кадре, и окно HUD подстраивалось ~74 раза в секунду с дробными размерами —
+/// HUD мерцал, а иконки дёргались. Прозрачность размер не меняет: окно подстраивается один раз.
+enum HUDFade {
+    static let card = AnyTransition.opacity.animation(.easeOut(duration: 0.14))
+    static let avatar = AnyTransition.opacity.animation(.easeOut(duration: 0.18))
+}
+
 struct HUDRootView: View {
     @ObservedObject var model: AppModel
     var onSize: (CGSize) -> Void = { _ in }
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 8) {
+        let left = model.settings.anchorLeft
+        VStack(alignment: left ? .leading : .trailing, spacing: 8) {
             AvatarRow(model: model)
             if let key = model.selectedKey, let s = model.store.session(key) {
                 SessionCard(model: model, session: s)
-                    .transition(.asymmetric(insertion: .scale(scale: 0.96, anchor: .topTrailing).combined(with: .opacity),
-                                            removal: .opacity))
+                    .transition(HUDFade.card)
             }
         }
         .padding(14)   // место под тень
         .fixedSize()
         .tint(Brand.accent)
-        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: model.selectedKey)
-        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: model.visibleSessions.map(\.id))
         .onGeometryChange(for: CGSize.self) { $0.size } action: { onSize($0) }
+        // Содержимое прижато к углу-якорю. Если окно на кадр разошлось с содержимым по размеру,
+        // содержимое не уезжает к центру окна (раньше оно на этот кадр смещалось на полразницы).
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: left ? .topLeading : .topTrailing)
+    }
+}
+
+/// Сколько места окошку сессии по высоте: экран минус строка меню, ряд иконок и поля.
+enum HUDMetrics {
+    @MainActor static var maxCardHeight: CGFloat {
+        let screen = NSScreen.main?.visibleFrame.height ?? 800
+        return max(320, screen - 110)
     }
 }
 
@@ -66,30 +83,30 @@ struct AvatarRow: View {
     static let maxShown = 6
 
     var body: some View {
-        let sessions = model.visibleSessions
-        // Сначала те, кто ждёт пользователя.
-        let sorted = sessions.sorted { a, b in
-            let pa = a.state.needsUser ? 0 : 1, pb = b.state.needsUser ? 0 : 1
-            return pa != pb ? pa < pb : a.startedAt < b.startedAt
-        }
+        // Порядок устойчивый — по времени появления. Раньше ждущие прыгали в начало ряда и обратно
+        // на каждом запросе разрешения, и иконки постоянно менялись местами.
+        let sorted = Self.ordered(model.visibleSessions)
         let shown = Array(sorted.prefix(Self.maxShown))
-        let rest = sorted.count - shown.count
+        let overflow = Array(sorted.dropFirst(Self.maxShown))
+        let overflowWaits = overflow.contains { $0.state.needsUser || $0.state == .expired }
         let labels = model.settings.projectLabels ? model.projectShortLabels : [:]
 
         HStack(alignment: .top, spacing: 6) {
             ForEach(shown) { s in
                 AvatarButton(model: model, session: s, projectLabel: labels[s.cwd])
-                    .transition(.scale(scale: 0.3).combined(with: .opacity))
+                    .transition(HUDFade.avatar)
             }
-            if rest > 0 {
+            if !overflow.isEmpty {
                 Menu {
-                    ForEach(sorted.dropFirst(Self.maxShown)) { s in
+                    ForEach(overflow) { s in
                         Button("\(s.projectName) — \(s.state.title)") { model.select(s.id) }
                     }
                 } label: {
-                    Text("+\(rest)").font(.system(size: 12, weight: .semibold, design: .rounded))
+                    Text("+\(overflow.count)").font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(overflowWaits ? Color.orange : Color.primary)
                         .frame(width: 30, height: 40)
                 }
+                .help(overflowWaits ? "Среди остальных сессий кто-то ждёт тебя" : "Остальные сессии")
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()
@@ -98,6 +115,10 @@ struct AvatarRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .glass(16)
+    }
+
+    static func ordered(_ sessions: [AgentSession]) -> [AgentSession] {
+        sessions.sorted { a, b in a.startedAt != b.startedAt ? a.startedAt < b.startedAt : a.id < b.id }
     }
 }
 
@@ -116,7 +137,7 @@ struct AvatarButton: View {
                     .padding(3)
                 if let projectLabel {
                     ProjectChip(cwd: session.cwd, label: projectLabel)
-                        .frame(maxWidth: 58)
+                        .frame(maxWidth: 66)
                 }
             }
             .padding(.bottom, projectLabel == nil ? 0 : 2)
@@ -165,6 +186,8 @@ struct SessionCard: View {
                     }
                 }
                 .id(p.id)
+                // Запрос с кнопками раскладывается первым; сжимается лента шагов, а не он.
+                .layoutPriority(1)
             } else if let p = session.expiredPending {
                 ExpiredView(model: model, session: session, request: p)
             } else if session.state.needsUser {
@@ -184,6 +207,9 @@ struct SessionCard: View {
         }
         .padding(12)
         .frame(width: 360, alignment: .leading)
+        // Не выше экрана: при огромном вводе (например, длинный скрипт) кнопки уезжали за нижний край.
+        // Сжимаются прокручиваемые части — подробности запроса и лента шагов.
+        .frame(maxHeight: HUDMetrics.maxCardHeight, alignment: .top)
         .glass(14)
     }
 
@@ -325,11 +351,22 @@ struct LastMessageView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(text)
-                .font(.system(size: 12))
-                .lineLimit(expanded ? 30 : 3)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            if expanded {
+                ScrollView {
+                    Text(verbatim: text.count > 6000 ? String(text.prefix(6000)) + "…" : text)
+                        .font(.system(size: 12))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 260)
+            } else {
+                Text(verbatim: String(text.prefix(600)))
+                    .font(.system(size: 12))
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if text.count > 160 || text.filter({ $0 == "\n" }).count > 2 {
                 Button(expanded ? "Свернуть" : "Показать целиком") { expanded.toggle() }
                     .buttonStyle(.link).font(.system(size: 11))

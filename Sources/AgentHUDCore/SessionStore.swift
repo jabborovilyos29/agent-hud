@@ -55,7 +55,9 @@ public struct SessionStore: Sendable, Equatable {
         var s = sessions[key] ?? AgentSession(kind: e.kind, sessionId: e.sessionId, cwd: e.cwd ?? "", now: e.time)
         if sessions[key] == nil {
             order.append(key)
-            if e.kind == .codex, case .sessionStarted = e.body { s.revealed = false }
+            // Сессия без задачи появляется в HUD только с первым делом (промпт, шаг, запрос):
+            // приложение Codex открывает служебные треды, а VS Code — сессию на каждую открытую панель Claude.
+            if case .sessionStarted = e.body, e.kind == .codex || e.host?.isEditor == true { s.revealed = false }
         }
         let summarizer = adapter ?? Adapters.adapter(for: e.kind)
 
@@ -64,7 +66,9 @@ public struct SessionStore: Sendable, Equatable {
         if let h = e.host { s.host = Self.merge(s.host, h) }
         s.lastEventAt = e.time
         if s.baseState == .ended, !Self.isEnd(e.body) { s.baseState = .idle }
-        s.hidden = false
+        // Скрытая сессия возвращается с новой задачей или когда ждёт тебя — не на каждом шаге:
+        // иначе в VS Code, где события идут постоянно, «Скрыть» не действовало дольше секунды.
+        if Self.unhides(e.body) { s.hidden = false }
 
         var released: [String] = []
 
@@ -74,7 +78,9 @@ public struct SessionStore: Sendable, Equatable {
             if s.baseState == .starting { s.baseState = .idle }
 
         case .promptSubmitted(let text):
-            if s.title.isEmpty { s.title = Self.makeTitle(text) }
+            // Заголовок — первая настоящая задача. Служебные вставки (<task-notification>, <command-name>…) — не задача.
+            // Последний промпт заголовком не берём: им часто бывает короткий ответ на вопрос агента («красный»).
+            if s.title.isEmpty, !Self.isInjectedPrompt(text) { s.title = Self.makeTitle(text) }
             s.revealed = true
             s.waitingNote = nil
             s.askedUserThisTurn = false
@@ -120,22 +126,29 @@ public struct SessionStore: Sendable, Equatable {
 
         case .permissionRequested(let rid, let tool, let input, let deadline, let suggestions):
             s.baseState = .working
+            s.revealed = true
             if !s.pending.contains(where: { $0.id == rid }) {
+                // Агент спрашивает следующее — значит, на прошлый его запрос уже ответили
+                // (например, «No» в VS Code: PostToolUse тогда не придёт, и запрос висел бы до конца хода).
+                released += Self.resolveSuperseded(&s, agentId: e.agentId)
                 let kind: PendingKind = tool == ClaudeCodeAdapter.planTool
                     ? .plan(text: input["plan"]?.stringValue ?? "", rawInput: input)
                     : .permission(toolName: tool, toolInput: input)
                 s.pending.append(PendingRequest(
                     id: rid, kind: kind, createdAt: e.time,
                     deadline: deadline, status: .open, inputFingerprint: fingerprint(toolName: tool, input: input),
-                    suggestions: suggestions))
+                    suggestions: suggestions, agentId: e.agentId))
             }
 
         case .questionAsked(let rid, let qs, let raw, let deadline):
             s.baseState = .working
+            s.revealed = true
             if !s.pending.contains(where: { $0.id == rid }) {
+                released += Self.resolveSuperseded(&s, agentId: e.agentId)
                 s.pending.append(PendingRequest(
                     id: rid, kind: .question(qs, rawInput: raw), createdAt: e.time,
-                    deadline: deadline, status: .open, inputFingerprint: fingerprint(toolName: "AskUserQuestion", input: raw)))
+                    deadline: deadline, status: .open, inputFingerprint: fingerprint(toolName: "AskUserQuestion", input: raw),
+                    agentId: e.agentId))
             }
 
         case .subagentStarted(let aid, let type):
@@ -151,6 +164,11 @@ public struct SessionStore: Sendable, Equatable {
                 s.steps[i].status = .ok
                 s.steps[i].durationMs = Int(e.time.timeIntervalSince(s.steps[i].startedAt) * 1000)
             }
+            // Субагент закончил — его запросы больше никто не ждёт.
+            let stale = s.pending.filter { $0.agentId == aid }
+            s.pending.removeAll { $0.agentId == aid }
+            released += stale.filter { $0.status == .open }.map(\.id)
+            if s.activePending == nil, s.baseState == .waitingPermission { s.baseState = .working }
 
         case .stopped(let msg, let failed):
             // Агент задал вопрос в приложении и закончил ход — он ждёт ответа, а не «готов».
@@ -190,7 +208,9 @@ public struct SessionStore: Sendable, Equatable {
 
         case .notification(let type, _):
             // Агент ждёт в самом терминале (например, после «ответить в терминале» или ExitPlanMode).
-            if (type == "permission_prompt" || type == "elicitation_dialog"), s.activePending == nil {
+            // Только посреди хода: уведомление приходит с задержкой и после конца хода включало ложное «ждёт».
+            if (type == "permission_prompt" || type == "elicitation_dialog"), s.activePending == nil,
+               s.baseState == .working || s.baseState == .starting {
                 s.baseState = .waitingPermission
             }
         }
@@ -297,6 +317,32 @@ public struct SessionStore: Sendable, Equatable {
         s.pending.removeAll()
         if s.baseState == .waitingPermission { s.baseState = .working }
         return released
+    }
+
+    /// Новый запрос того же агента (основного или того же субагента) вытесняет его прошлые открытые запросы:
+    /// агент не спросит следующее, пока ему не ответили на предыдущее.
+    private static func resolveSuperseded(_ s: inout AgentSession, agentId: String?) -> [String] {
+        let old = s.pending.filter { $0.status == .open && $0.agentId == agentId && !$0.autoReview }
+        guard !old.isEmpty else { return [] }
+        s.pending.removeAll { p in old.contains { $0.id == p.id } }
+        return old.map(\.id)
+    }
+
+    /// События, с которыми скрытая сессия снова показывается.
+    static func unhides(_ b: AgentEvent.Body) -> Bool {
+        switch b {
+        case .promptSubmitted, .permissionRequested, .questionAsked: return true
+        default: return false
+        }
+    }
+
+    /// Вставки самого Claude Code в поток промптов: уведомления фоновых задач, слэш-команды, вывод команд.
+    /// Начинаются с тега вида `<task-notification>`; живой промпт так почти никогда не начинается.
+    public static func isInjectedPrompt(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.hasPrefix("<"), let close = t.firstIndex(of: ">") else { return false }
+        let tag = t[t.index(after: t.startIndex)..<close]
+        return !tag.isEmpty && tag.count <= 40 && tag.allSatisfy { $0.isLowercase || $0 == "-" || $0 == "_" || $0.isNumber }
     }
 
     /// Инструмент выполнился — снять запрос, который относился к нему.

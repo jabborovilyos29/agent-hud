@@ -31,9 +31,14 @@ final class StatusMenu: NSObject, NSPopoverDelegate {
             .store(in: &cancellables)
     }
 
+    private var shownWaiting = -1
+
     private func updateButton() {
         guard let b = item.button else { return }
         let waiting = model.visibleSessions.filter { $0.state.needsUser }.count
+        // Перерисовываем значок в строке меню, только когда меняется число ждущих, а не на каждом событии.
+        guard waiting != shownWaiting else { return }
+        shownWaiting = waiting
         let img = NSImage(systemSymbolName: waiting > 0 ? "circle.hexagongrid.fill" : "circle.hexagongrid",
                           accessibilityDescription: "AgentHUD")
         img?.isTemplate = true

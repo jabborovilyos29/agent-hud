@@ -695,9 +695,28 @@ func events(_ m: HookMessage, at t: Date = t0) -> [AgentEvent] { adapter.events(
 
     @Test func singleAndUnrelated() {
         #expect(ProjectNames.shortLabels(for: ["/d/taklif"]) == ["/d/taklif": "taklif"])
-        #expect(ProjectNames.shortLabels(for: ["/d/a-very-long-project-name"])["/d/a-very-long-project-name"]?.count == 9)
+        #expect(ProjectNames.shortLabels(for: ["/d/a-very-long-project-name"])["/d/a-very-long-project-name"]?.count == 10)
+        // Проекты без общего первого слова сохраняют полное имя.
         let l = ProjectNames.shortLabels(for: ["/d/taklif", "/d/qr-menu", "/d/taklif"])
-        #expect(l == ["/d/taklif": "taklif", "/d/qr-menu": "qr"])
+        #expect(l == ["/d/taklif": "taklif", "/d/qr-menu": "qr-menu"])
+    }
+
+    @Test func sharedPrefixOnlyAmongRelatives() {
+        let l = ProjectNames.shortLabels(for: ["/d/agent-hub", "/d/acme-platform", "/d/acme-mobile-app/acme-mobile-app"])
+        #expect(l["/d/agent-hub"] == "agent-hub")              // раньше было бы «agent»
+        #expect(l["/d/acme-platform"] == "platform")
+        #expect(l["/d/acme-mobile-app/acme-mobile-app"] == "mobile")
+        // Одиночный «родственник» префикс не теряет.
+        #expect(ProjectNames.shortLabels(for: ["/d/agent-hub", "/d/acme-platform"])["/d/acme-platform"] == "acme-plat…")
+    }
+
+    @Test func labelsAreStableWithinUniverse() {
+        // Метки считаются по устойчивому набору проектов: уход сессии не меняет метки остальных.
+        let universe = ["/d/acme-mobile", "/d/acme-web", "/d/acme-api", "/d/taklif"]
+        let all = ProjectNames.shortLabels(for: universe)
+        let fewer = ProjectNames.shortLabels(for: universe + ["/d/acme-web"])
+        #expect(all == fewer)
+        #expect(all["/d/acme-web"] == "web" && all["/d/taklif"] == "taklif")
     }
 
     @Test func stableHue() {
@@ -789,5 +808,102 @@ func events(_ m: HookMessage, at t: Date = t0) -> [AgentEvent] { adapter.events(
         #expect(stats.edits == 2 && stats.commands == 1)
         #expect(stats.files == ["src/a.ts"])
         #expect(stats.durationSec == 60)
+    }
+}
+
+// MARK: - Мерцание: запросы, уведомления, скрытие (форк 0.2.1)
+
+@Suite struct StaleStateTests {
+    let sid = "11111111-2222-3333-4444-555555555555"
+    var key: String { "claude:" + sid }
+
+    func ev(_ dt: TimeInterval, _ body: AgentEvent.Body, agent: String? = nil, host: HostInfo? = nil) -> AgentEvent {
+        AgentEvent(kind: .claude, sessionId: sid, cwd: "/Users/dev/project", agentId: agent, host: host,
+                   time: t0.addingTimeInterval(dt), body: body)
+    }
+
+    func perm(_ rid: String, _ cmd: String, _ dt: TimeInterval, agent: String? = nil) -> AgentEvent {
+        ev(dt, .permissionRequested(requestId: rid, toolName: "Bash", input: ["command": .string(cmd)],
+                                    deadline: t0.addingTimeInterval(600), suggestions: []), agent: agent)
+    }
+
+    @Test func newRequestOfSameAgentSupersedesOld() {
+        var st = SessionStore()
+        st.apply(ev(0, .promptSubmitted("задача")))
+        #expect(st.apply(perm("r1", "rm -rf a", 1)).isEmpty)
+        // Ответили «No» в VS Code: PostToolUse не будет. Следующий запрос того же агента снимает прошлый.
+        #expect(st.apply(perm("r2", "ls", 2)) == ["r1"])
+        #expect(st.session(key)?.pending.map(\.id) == ["r2"])
+        // Запрос субагента не вытесняет запрос основного агента — и наоборот.
+        #expect(st.apply(perm("s1", "npm test", 3, agent: "sub-1")).isEmpty)
+        #expect(Set(st.session(key)?.pending.map(\.id) ?? []) == ["r2", "s1"])
+    }
+
+    @Test func subagentStopReleasesItsRequests() {
+        var st = SessionStore()
+        st.apply(ev(0, .promptSubmitted("задача")))
+        st.apply(perm("s1", "npm test", 1, agent: "sub-1"))
+        #expect(st.session(key)?.state == .waitingPermission)
+        #expect(st.apply(ev(2, .subagentStopped(agentId: "sub-1"))) == ["s1"])
+        #expect(st.session(key)?.state == .working)
+    }
+
+    @Test func lateNotificationAfterStopIsIgnored() {
+        var st = SessionStore()
+        st.apply(ev(0, .promptSubmitted("задача")))
+        st.apply(ev(1, .stopped(lastMessage: "готово", failed: false)))
+        st.apply(ev(2, .notification(type: "permission_prompt", message: nil)))
+        #expect(st.session(key)?.state == .done)          // раньше: ложное «Ждёт разрешения» до следующей задачи
+        st.apply(ev(3, .promptSubmitted("ещё")))
+        st.apply(ev(4, .notification(type: "permission_prompt", message: nil)))
+        #expect(st.session(key)?.state == .waitingPermission)   // посреди хода — по-прежнему ждёт
+    }
+
+    @Test func injectedPromptsDoNotBecomeTitles() {
+        #expect(SessionStore.isInjectedPrompt("<task-notification>\n<task-id>x</task-id>"))
+        #expect(SessionStore.isInjectedPrompt("  <command-name>/review</command-name>"))
+        #expect(!SessionStore.isInjectedPrompt("Почини <div> в шапке"))
+        #expect(!SessionStore.isInjectedPrompt("<Div> сломался"))
+        #expect(!SessionStore.isInjectedPrompt("обычный промпт"))
+        var st = SessionStore()
+        st.apply(ev(0, .promptSubmitted("Почини экран вакансий")))
+        st.apply(ev(1, .promptSubmitted("<task-notification><task-id>b1</task-id></task-notification>")))
+        #expect(st.session(key)?.title == "Почини экран вакансий")
+        // Первая настоящая задача остаётся заголовком (ответы на вопросы агента его не затирают).
+        st.apply(ev(2, .promptSubmitted("красный")))
+        #expect(st.session(key)?.title == "Почини экран вакансий")
+        // Если HUD увидел сессию с середины и первой пришла вставка — заголовком станет первый живой промпт.
+        var mid = SessionStore()
+        mid.apply(ev(0, .promptSubmitted("<task-notification>x</task-notification>")))
+        #expect(mid.session(key)?.title == "")
+        mid.apply(ev(1, .promptSubmitted("Сделай коммит")))
+        #expect(mid.session(key)?.title == "Сделай коммит")
+    }
+
+    @Test func hiddenStaysHiddenUntilNewTaskOrRequest() {
+        var st = SessionStore()
+        st.apply(ev(0, .promptSubmitted("задача")))
+        st.hide(key)
+        st.apply(ev(1, .toolStarted(toolName: "Read", input: ["file_path": "/a"], toolUseId: "t1")))
+        st.apply(ev(2, .toolFinished(toolName: "Read", input: ["file_path": "/a"], toolUseId: "t1", durationMs: 1, failed: false)))
+        #expect(st.session(key)?.hidden == true)     // раньше возвращалась на первом же шаге
+        st.apply(perm("r1", "ls", 3))
+        #expect(st.session(key)?.hidden == false)    // ждёт тебя — показываем
+        st.hide(key)
+        st.apply(ev(4, .promptSubmitted("новая")))
+        #expect(st.session(key)?.hidden == false)
+    }
+
+    @Test func editorSessionAppearsWithFirstTask() {
+        let vscode = HostInfo(appBundleId: HostInfo.vscode, entrypoint: HostInfo.vscodeEntrypoint)
+        var st = SessionStore()
+        st.apply(ev(0, .sessionStarted(source: "startup", model: nil), host: vscode))
+        #expect(st.visibleSessions.isEmpty)          // открытая панель Claude без задачи — не в HUD
+        st.apply(ev(1, .promptSubmitted("задача")))
+        #expect(st.visibleSessions.count == 1)
+        // Терминальная сессия видна сразу, как раньше.
+        var term = SessionStore()
+        term.apply(ev(0, .sessionStarted(source: "startup", model: nil), host: HostInfo(tty: "/dev/ttys001")))
+        #expect(term.visibleSessions.count == 1)
     }
 }
