@@ -169,3 +169,14 @@ Claude Code в pty с установленными хуками: `SessionStart �
 - **Codex без Codex.** Агент без своей папки настроек в панели не показывается, `--connect all` подключает только установленных агентов (раньше создавался `~/.codex/hooks.json`). Код адаптера Codex не тронут.
 - **Тесты под Xcode.** `Package.swift` подключал Swift Testing из Command Line Tools, если находил его, — под компилятором Xcode тесты не собирались (`no type named '__TestContentRecord'`). Теперь фреймворк выбирается по активному тулчейну (`DEVELOPER_DIR` или `/var/db/xcode_select_link`): с Xcode — только `rpath` на его `Testing.framework`, с CLT — как было.
 - **Проверки.** 74 юнит-теста (было 52), `--selftest` через настоящий сокет и хук (добавлены «Всегда» и оба исхода плана), `--uitest` (метки проектов, окно карты), `scripts/integration_test.py`.
+
+### Живая проверка после установки (2026-11-20)
+
+`scripts/build-app.sh --install`, `--connect all` (подключён только Claude Code: Codex на машине нет, `~/.codex` не создан), сессии в расширении VS Code 2.1.327:
+- **Запросы разрешения из VS Code приходят в HUD**, «Разрешить» из HUD применяется — команда выполняется. Видны сессии из нескольких окон VS Code одновременно.
+- **«В VS Code»** (отпустить запрос) — запрос уходит в чат VS Code, ответ там проходит.
+- **«Всегда»** с подсказкой Claude — правило записано в `.claude/settings.local.json` проекта (`destination: localSettings`).
+- **Уже открытая сессия VS Code** подхватила хуки без перезапуска (события и запросы пошли сразу после `--connect`).
+- Хук на машине — бинарник из `~/Applications/AgentHUD.app` через симлинк `~/.local/bin/agenthud-hook`; `settings.json` до и после совпадает во всём, кроме добавленного блока `hooks` (копия — `settings.json.agenthud-backup-<дата>`).
+
+Ещё не проверено вживую: вопрос `AskUserQuestion` и одобрение плана в VS Code.
