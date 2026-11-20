@@ -87,6 +87,37 @@ enum SelfTest {
         o = finish(p, out)
         check("хук вернул deny + причину", o.contains("\"behavior\":\"deny\"") && o.contains("не сейчас"), o)
 
+        print("Разрешить всегда (шаблон правила)")
+        (p, out) = spawn("permission", "permission-PermissionRequest")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        if let pend = model.store.session(key)?.activePending {
+            check("подсказки Claude дошли до окошка", !pend.suggestions.isEmpty)
+            let rule: JSONValue = ["type": "addRules", "behavior": "allow", "destination": "localSettings",
+                                   "rules": [["toolName": "Bash", "ruleContent": "node *"]]]
+            model.decide(pend.id, .allowWith([rule]))
+        } else { check("запрос пришёл", false) }
+        o = finish(p, out)
+        check("allow + updatedPermissions", o.contains("\"behavior\":\"allow\"") && o.contains("\"updatedPermissions\"")
+              && o.contains("node *"), o)
+
+        print("План: одобрить и принимать правки")
+        (p, out) = spawn("permission", "permission-ExitPlanMode")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        if let pend = model.store.session(key)?.activePending {
+            check("окошко плана", pend.kind.isPlan, "\(pend.kind)")
+            model.decide(pend.id, .allowWith(PermissionRules.planApproval(acceptEdits: true)))
+        } else { check("план пришёл", false) }
+        o = finish(p, out)
+        check("allow + updatedInput с планом + setMode acceptEdits",
+              o.contains("\"updatedInput\"") && o.contains("Добавить фильтр") && o.contains("acceptEdits"), o)
+
+        print("План: доработать с замечанием")
+        (p, out) = spawn("permission", "permission-ExitPlanMode")
+        pump(3) { model.store.session(key)?.activePending != nil }
+        if let rid = model.store.session(key)?.activePending?.id { model.decide(rid, .deny(reason: "без миграций")) }
+        o = finish(p, out)
+        check("deny + замечание к плану", o.contains("\"behavior\":\"deny\"") && o.contains("без миграций"), o)
+
         print("Ответ на вопрос")
         (p, out) = spawn("question", "question-PreToolUse-AskUserQuestion")
         pump(3) { model.store.session(key)?.activePending != nil }
@@ -219,9 +250,23 @@ enum UITest {
               "\(model.store.session("claude:demo-a")?.state as Any)")
 
         print("Скрытие сессии")
-        model.hide("codex:demo-d")
+        model.hide("claude:demo-d")
         pump(0.4)
-        check("сессия скрыта", !model.visibleSessions.contains { $0.id == "codex:demo-d" })
+        check("сессия скрыта", !model.visibleSessions.contains { $0.id == "claude:demo-d" })
+
+        print("Метки проектов под иконками")
+        let labels = model.projectShortLabels
+        check("у каждой видимой сессии своя метка", Set(model.visibleSessions.map { labels[$0.cwd] ?? "" }).count
+                == Set(model.visibleSessions.map(\.cwd)).count, "\(labels)")
+
+        print("Карта агентов")
+        let map = AgentMapController(model: model)
+        map.show()
+        pump(0.6)
+        check("окно карты открыто", map.isShown)
+        map.close()
+        pump(0.3)
+        check("окно карты закрыто", !map.isShown)
 
         print("Панель в строке меню")
         let menu = StatusMenu(model: model, hud: hud)

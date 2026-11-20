@@ -47,18 +47,21 @@ struct PermissionView: View {
             } else {
                 HStack(spacing: 6) {
                     Button { model.decide(request.id, .allow) } label: {
-                        Label("Разрешить", systemImage: "checkmark").frame(minWidth: 90)
+                        Label("Разрешить", systemImage: "checkmark").frame(minWidth: 84)
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: .command)
-                    .help("Разрешить (⌘↩)")
-                    Button("Отклонить…") { denying = true; reasonFocused = true }
-                    Spacer()
-                    Button { model.decide(request.id, .passthrough) } label: {
-                        Label(session.host.isDesktopApp ? "В приложении" : "В терминале",
-                              systemImage: session.host.isDesktopApp ? "macwindow" : "terminal")
+                    .help("Разрешить один раз (⌘↩)")
+                    if !ruleOptions.isEmpty {
+                        AlwaysMenu(options: ruleOptions) { o in model.decide(request.id, .allowWith([o.update])) }
                     }
-                    .help("Ответить там, где работает агент: окошко закроется, откроется его сессия")
+                    Button("Отклонить…") { denying = true; reasonFocused = true }
+                    Spacer(minLength: 0)
+                    Button { model.decide(request.id, .passthrough) } label: {
+                        Label(session.host.passthroughTitle, systemImage: session.host.placeSymbol)
+                            .labelStyle(.iconOnly)
+                    }
+                    .help("\(session.host.passthroughTitle): ответить там, где работает агент — окошко закроется, откроется его сессия")
                 }
                 .controlSize(.small)
             }
@@ -72,8 +75,130 @@ struct PermissionView: View {
         return tool
     }
 
+    /// «Разрешить всегда» — только Claude Code (у хуков Codex такого ответа нет).
+    private var ruleOptions: [RuleOption] {
+        guard session.kind == .claude, !request.autoReview else { return [] }
+        return PermissionRules.options(toolName: tool, input: input, suggestions: request.suggestions)
+    }
+
     private func deny() {
         model.decide(request.id, .deny(reason: reason.isEmpty ? nil : reason))
+    }
+}
+
+/// Меню «Всегда»: шаблон от HUD (короче список правил) и подсказки самого Claude Code.
+struct AlwaysMenu: View {
+    let options: [RuleOption]
+    let pick: (RuleOption) -> Void
+
+    var body: some View {
+        Menu {
+            let generated = options.filter(\.generated)
+            let suggested = options.filter { !$0.generated }
+            if !generated.isEmpty {
+                Section("Шаблон") {
+                    ForEach(generated) { o in Button("\(o.title) — \(o.scope)") { pick(o) } }
+                }
+            }
+            if !suggested.isEmpty {
+                Section("Как предлагает Claude") {
+                    ForEach(suggested) { o in Button("\(o.title) — \(o.scope)") { pick(o) } }
+                }
+            }
+        } label: {
+            Text("Всегда")
+        }
+        .fixedSize()
+        .help("Разрешить и больше не спрашивать: правило запишется в настройки Claude Code")
+    }
+}
+
+// MARK: - План (ExitPlanMode)
+
+struct PlanView: View {
+    @ObservedObject var model: AppModel
+    let session: AgentSession
+    let request: PendingRequest
+    let text: String
+
+    @State private var revising = false
+    @State private var feedback = ""
+    @State private var expanded = false
+    @FocusState private var feedbackFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "list.bullet.clipboard.fill").foregroundStyle(.orange)
+                Text("План готов — одобрить?").font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Countdown(deadline: request.deadline)
+            }
+            planText
+            if revising {
+                HStack(spacing: 6) {
+                    TextField("Что изменить в плане", text: $feedback)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .focused($feedbackFocused)
+                        .onSubmit { revise() }
+                    Button("Отправить") { revise() }
+                    Button("Отмена") { revising = false }
+                }
+                .controlSize(.small)
+            } else {
+                HStack(spacing: 6) {
+                    Button { model.decide(request.id, .allowWith(PermissionRules.planApproval(acceptEdits: false))) } label: {
+                        Label("Одобрить", systemImage: "checkmark").frame(minWidth: 84)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help("Одобрить план; правки файлов агент будет согласовывать (⌘↩)")
+                    Button("Одобрить и править сразу") {
+                        model.decide(request.id, .allowWith(PermissionRules.planApproval(acceptEdits: true)))
+                    }
+                    .help("Одобрить план и до конца сессии принимать правки файлов без вопросов")
+                }
+                .controlSize(.small)
+                HStack(spacing: 6) {
+                    Button("Доработать…") { revising = true; feedbackFocused = true }
+                        .help("Оставить агента в режиме планирования и передать замечания")
+                    Spacer()
+                    Button { model.decide(request.id, .passthrough) } label: {
+                        Label(session.host.passthroughTitle, systemImage: session.host.placeSymbol)
+                    }
+                    .help("Ответить там, где работает агент: окошко закроется, откроется его сессия")
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.09)))
+    }
+
+    private var planText: some View {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let limit = expanded ? 400 : 14
+        return VStack(alignment: .leading, spacing: 4) {
+            ScrollView {
+                Text(verbatim: lines.prefix(limit).joined(separator: "\n"))
+                    .font(.system(size: 11))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+            }
+            .frame(maxHeight: expanded ? 320 : 200)
+            .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.05)))
+            if lines.count > 14 {
+                Button(expanded ? "Свернуть" : "Показать целиком (\(lines.count) строк)") { expanded.toggle() }
+                    .buttonStyle(.link).font(.system(size: 11))
+            }
+        }
+    }
+
+    private func revise() {
+        model.decide(request.id, .deny(reason: feedback.isEmpty ? nil : feedback))
     }
 }
 
@@ -189,7 +314,7 @@ struct DiffBlock: View {
 
 struct QuestionView: View {
     @ObservedObject var model: AppModel
-    var desktop = false
+    var host = HostInfo()
     let request: PendingRequest
     let questions: [Question]
 
@@ -241,7 +366,7 @@ struct QuestionView: View {
                     .help("Ответить (⌘↩)")
                 Spacer()
                 Button { model.decide(request.id, .passthrough) } label: {
-                    Label(desktop ? "В приложении" : "В терминале", systemImage: desktop ? "macwindow" : "terminal")
+                    Label(host.passthroughTitle, systemImage: host.placeSymbol)
                 }
                 .help("Ответить там, где работает агент: окошко закроется, откроется его сессия")
             }
@@ -342,6 +467,7 @@ struct ExpiredView: View {
             switch request.kind {
             case .permission(let t, _): return "Запрос разрешения (\(t))"
             case .question: return "Вопрос агента"
+            case .plan: return "План на одобрение"
             }
         }()
         VStack(alignment: .leading, spacing: 6) {
@@ -349,11 +475,11 @@ struct ExpiredView: View {
                 Image(systemName: "clock.badge.exclamationmark").foregroundStyle(Color(red: 0.75, green: 0.5, blue: 0.25))
                 Text("Просрочено").font(.system(size: 12, weight: .semibold))
             }
-            Text("\(what) ждал слишком долго и ушёл в \(session.host.isDesktopApp ? "приложение" : "терминал"). Ответьте там.")
+            Text("\(what) ждал слишком долго и ушёл в \(session.host.placeTo). Ответь там.")
                 .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Button { model.open(session.id) } label: {
-                    Label(session.host.isDesktopApp ? "Открыть сессию" : "Открыть терминал", systemImage: "arrow.up.forward.app")
+                    Label(session.host.openTitle, systemImage: "arrow.up.forward.app")
                 }
                     .buttonStyle(.borderedProminent)
                 Button("Убрать") { model.dismissExpired(session.id) }

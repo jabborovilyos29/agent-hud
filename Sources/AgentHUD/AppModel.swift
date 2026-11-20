@@ -33,6 +33,14 @@ final class Settings: ObservableObject {
     @Published var hookTimeout: Int { didSet { d.set(hookTimeout, forKey: "hookTimeout") } }
     @Published var notifications: Bool { didSet { d.set(notifications, forKey: "notifications") } }
     @Published var animations: Bool { didSet { d.set(animations, forKey: "animations") } }
+    /// Подпись проекта под иконкой агента (когда агент один, иконки одинаковые).
+    @Published var projectLabels: Bool { didSet { d.set(projectLabels, forKey: "projectLabels") } }
+    /// Журнал активности для сводки за день и вкладки «Сегодня» (только локально).
+    @Published var activityLog: Bool { didSet { d.set(activityLog, forKey: "activityLog") } }
+    /// Быстрые промпты для сессий в VS Code (вставляются в поле ввода сессии).
+    @Published var quickPrompts: [String] { didSet { d.set(quickPrompts, forKey: "quickPrompts") } }
+
+    static let defaultQuickPrompts = ["Продолжай", "Прогони тесты и почини, что упало", "Проверь линтер и типы", "Сделай коммит"]
 
     /// Правый верхний угол HUD в координатах экрана; nil — по умолчанию.
     var anchor: CGPoint? {
@@ -61,6 +69,9 @@ final class Settings: ObservableObject {
         hookTimeout = d.object(forKey: "hookTimeout") as? Int ?? HookTiming.defaultTimeout
         notifications = d.object(forKey: "notifications") as? Bool ?? true
         animations = d.object(forKey: "animations") as? Bool ?? true
+        projectLabels = d.object(forKey: "projectLabels") as? Bool ?? true
+        activityLog = d.object(forKey: "activityLog") as? Bool ?? true
+        quickPrompts = (d.stringArray(forKey: "quickPrompts") ?? Self.defaultQuickPrompts).filter { !$0.isEmpty }
     }
 }
 
@@ -78,6 +89,8 @@ final class AppModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var notified = Set<String>()
     var onRequestNeedsAttention: ((AgentSession) -> Void)?
+    /// Открыть окно «Карта агентов» (его держит AppDelegate).
+    var onOpenMap: (() -> Void)?
 
     init(settings: Settings) {
         self.settings = settings
@@ -114,6 +127,7 @@ final class AppModel: ObservableObject {
         let now = Date()
         for e in adapter.events(from: m, now: now) {
             let released = store.apply(e, adapter: adapter)
+            logActivity(e)
             var event = m.payload["hook_event_name"]?.stringValue ?? m.mode.rawValue
             if case .autoReviewing = e.body { event = "auto_review" }
             let state = store.session(e.sessionKey)?.state.rawValue ?? "-"
@@ -126,6 +140,22 @@ final class AppModel: ObservableObject {
             requestArrived(s.id)
         }
         if let k = selectedKey, store.session(k) == nil || store.session(k)?.hidden == true { selectedKey = nil }
+    }
+
+    /// Промпт и конец хода — в журнал активности (для сводки за день и вкладки «Сегодня»).
+    private func logActivity(_ e: AgentEvent) {
+        guard settings.activityLog, let s = store.session(e.sessionKey), e.agentId == nil else { return }
+        switch e.body {
+        case .promptSubmitted(let text):
+            ActivityLog.append(ActivityRecord(kind: .prompt, time: e.time, agent: s.kind.rawValue, session: s.sessionId,
+                                              project: s.projectName, cwd: s.cwd, text: String(text.prefix(600))))
+        case .stopped(let msg, let failed):
+            ActivityLog.append(ActivityRecord(kind: .stop, time: e.time, agent: s.kind.rawValue, session: s.sessionId,
+                                              project: s.projectName, cwd: s.cwd, text: String((msg ?? "").prefix(600)),
+                                              failed: failed, stats: s.turnStats(until: e.time)))
+        default:
+            break
+        }
     }
 
     private func requestArrived(_ key: String) {
@@ -177,6 +207,11 @@ final class AppModel: ObservableObject {
         server?.reply(HookReply(requestId: requestId, decision: decision))
         store.markAnswered(requestId)
         DecisionLog.append(session: s, request: p, decision: decision)
+        if settings.activityLog {
+            ActivityLog.append(ActivityRecord(kind: .decision, time: Date(), agent: s.kind.rawValue, session: s.sessionId,
+                                              project: s.projectName, cwd: s.cwd,
+                                              text: DecisionLog.describe(session: s, request: p), detail: decision.logLabel))
+        }
         if case .passthrough = decision { TerminalFocus.focus(s) }
         if selectedKey == s.id, !selectedByUser, store.session(s.id)?.activePending == nil { selectedKey = nil }
     }
@@ -201,6 +236,31 @@ final class AppModel: ObservableObject {
 
     func dismissExpired(_ key: String) { store.dismissExpired(key) }
 
+    func unhide(_ key: String) { store.unhide(key) }
+
+    /// Следующий промпт для сессии в VS Code: откроется её чат с текстом в поле ввода (отправляешь сам).
+    func prefillPrompt(_ key: String, _ text: String) {
+        guard let s = store.session(key), s.host.canPrefillPrompt else { return }
+        TerminalFocus.focusEditor(s, prompt: text)
+    }
+
+    /// Короткие метки проектов для видимых сессий («mobile», «web»…).
+    var projectShortLabels: [String: String] {
+        ProjectNames.shortLabels(for: store.visibleSessions.map(\.cwd))
+    }
+
+    func openMap() { onOpenMap?() }
+
+    /// Сводка за день в Markdown: файл в папке приложения (его же можно открыть или скопировать).
+    @discardableResult
+    func writeSummary(day: Date = Date()) -> URL {
+        let md = DailySummary.markdown(DailySummary.build(ActivityLog.read(day: day)), day: day)
+        let url = AgentHUDPaths.supportDirectory.appendingPathComponent("summaries/\(ActivityLog.file(for: day).deletingPathExtension().lastPathComponent).md")
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data(md.utf8).write(to: url)
+        return url
+    }
+
     // MARK: - Для демо и превью
 
     func inject(_ events: [AgentEvent]) {
@@ -216,19 +276,26 @@ final class AppModel: ObservableObject {
 
 /// Журнал решений: что разрешено/отклонено/отвечено и когда.
 enum DecisionLog {
-    static func append(session: AgentSession, request: PendingRequest, decision: Decision) {
-        let f = ISO8601DateFormatter()
-        var what = ""
+    static func describe(session: AgentSession, request: PendingRequest) -> String {
         switch request.kind {
         case .permission(let tool, let input):
-            what = Adapters.adapter(for: session.kind).summarize(toolName: tool, input: input, cwd: session.cwd)
+            return Adapters.adapter(for: session.kind).summarize(toolName: tool, input: input, cwd: session.cwd)
         case .question(let qs, _):
-            what = "Вопрос: " + (qs.first?.question ?? "")
+            return "Вопрос: " + (qs.first?.question ?? "")
+        case .plan(let text, _):
+            let first = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+            return "План: " + first.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
         }
+    }
+
+    static func append(session: AgentSession, request: PendingRequest, decision: Decision) {
+        let f = ISO8601DateFormatter()
+        let what = describe(session: session, request: request)
         var detail = ""
         switch decision {
         case .deny(let r): detail = r ?? ""
         case .answer(let a): detail = a.map { "\($0.key) → \($0.value)" }.joined(separator: "; ")
+        case .allowWith(let updates): detail = updates.compactMap(PermissionRules.describe).joined(separator: "; ")
         default: break
         }
         let line = [f.string(from: Date()), session.projectName, decision.logLabel, what, detail]

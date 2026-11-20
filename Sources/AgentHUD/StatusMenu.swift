@@ -74,9 +74,13 @@ final class StatusMenu: NSObject, NSPopoverDelegate {
     /// Статусы конфигов и автозапуска читаются при каждом открытии (и после действий).
     private func panel() -> ControlPanelView {
         var installed: [AgentKind: Bool] = [:]
-        for k in AgentKind.allCases { installed[k] = HookSetup.isInstalled(k) }
+        var present: [AgentKind: Bool] = [:]
+        for k in AgentKind.allCases {
+            installed[k] = HookSetup.isInstalled(k)
+            present[k] = HookSetup.agentPresent(k)
+        }
         return ControlPanelView(model: model, settings: model.settings, actions: actions(),
-                                installed: installed, loginItem: LoginItem.isEnabled)
+                                installed: installed, present: present, loginItem: LoginItem.isEnabled)
     }
 
     private func refresh() {
@@ -138,6 +142,15 @@ final class StatusMenu: NSObject, NSPopoverDelegate {
                 try? Data().write(to: url)
             }
             NSWorkspace.shared.open(url)
+        }
+        a.openMap = { [weak self] in
+            self?.closePopover()
+            self?.model.openMap()
+        }
+        a.openSummary = { [weak self] in
+            guard let self else { return }
+            self.closePopover()
+            NSWorkspace.shared.open(self.model.writeSummary())
         }
         a.quit = { NSApp.terminate(nil) }
         return a

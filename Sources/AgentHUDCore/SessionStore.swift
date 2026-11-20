@@ -41,7 +41,7 @@ public struct SessionStore: Sendable, Equatable {
         if ignored.contains(key) {
             // Служебная сессия: синхронные запросы сразу отпускаем.
             switch e.body {
-            case .permissionRequested(let rid, _, _, _), .questionAsked(let rid, _, _, _): return [rid]
+            case .permissionRequested(let rid, _, _, _, _), .questionAsked(let rid, _, _, _): return [rid]
             default: return []
             }
         }
@@ -81,6 +81,7 @@ public struct SessionStore: Sendable, Equatable {
             s.baseState = .working
             s.lastMessage = nil
             s.finishedAt = nil
+            s.turnStartedAt = e.time
             released += Self.resolveAll(&s)
 
         case .toolStarted(let tool, let input, let toolUseId):
@@ -117,12 +118,16 @@ public struct SessionStore: Sendable, Equatable {
             }
             released += Self.resolve(&s, toolName: tool, fingerprint: fp, command: Self.commandText(input))
 
-        case .permissionRequested(let rid, let tool, let input, let deadline):
+        case .permissionRequested(let rid, let tool, let input, let deadline, let suggestions):
             s.baseState = .working
             if !s.pending.contains(where: { $0.id == rid }) {
+                let kind: PendingKind = tool == ClaudeCodeAdapter.planTool
+                    ? .plan(text: input["plan"]?.stringValue ?? "", rawInput: input)
+                    : .permission(toolName: tool, toolInput: input)
                 s.pending.append(PendingRequest(
-                    id: rid, kind: .permission(toolName: tool, toolInput: input), createdAt: e.time,
-                    deadline: deadline, status: .open, inputFingerprint: fingerprint(toolName: tool, input: input)))
+                    id: rid, kind: kind, createdAt: e.time,
+                    deadline: deadline, status: .open, inputFingerprint: fingerprint(toolName: tool, input: input),
+                    suggestions: suggestions))
             }
 
         case .questionAsked(let rid, let qs, let raw, let deadline):
@@ -247,6 +252,13 @@ public struct SessionStore: Sendable, Equatable {
         sessions[key] = s
     }
 
+    /// Вернуть скрытую сессию (карта агентов показывает и скрытые).
+    public mutating func unhide(_ key: String) {
+        guard var s = sessions[key] else { return }
+        s.hidden = false
+        sessions[key] = s
+    }
+
     /// Убрать просроченное окошко без скрытия сессии.
     public mutating func dismissExpired(_ key: String) {
         guard var s = sessions[key] else { return }
@@ -293,6 +305,7 @@ public struct SessionStore: Sendable, Equatable {
         let match: (PendingRequest) -> Bool = { p in
             switch p.kind {
             case .question: return toolName == "AskUserQuestion"
+            case .plan: return toolName == ClaudeCodeAdapter.planTool
             case .permission(let t, let input):
                 if p.inputFingerprint == fp { return true }
                 // У команд сверяем саму команду: агент может добавить в запрос описание
@@ -356,7 +369,8 @@ public struct SessionStore: Sendable, Equatable {
                  processChain: new.processChain.isEmpty ? old.processChain : new.processChain,
                  appBundleId: new.appBundleId ?? old.appBundleId,
                  appName: new.appName ?? old.appName,
-                 hostSessionId: new.hostSessionId ?? old.hostSessionId)
+                 hostSessionId: new.hostSessionId ?? old.hostSessionId,
+                 entrypoint: new.entrypoint ?? old.entrypoint)
     }
 
     static func makeTitle(_ prompt: String) -> String {

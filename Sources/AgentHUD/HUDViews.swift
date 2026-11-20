@@ -52,6 +52,7 @@ struct HUDRootView: View {
         }
         .padding(14)   // место под тень
         .fixedSize()
+        .tint(Brand.accent)
         .animation(.spring(response: 0.32, dampingFraction: 0.85), value: model.selectedKey)
         .animation(.spring(response: 0.32, dampingFraction: 0.85), value: model.visibleSessions.map(\.id))
         .onGeometryChange(for: CGSize.self) { $0.size } action: { onSize($0) }
@@ -73,10 +74,11 @@ struct AvatarRow: View {
         }
         let shown = Array(sorted.prefix(Self.maxShown))
         let rest = sorted.count - shown.count
+        let labels = model.settings.projectLabels ? model.projectShortLabels : [:]
 
-        HStack(spacing: 6) {
+        HStack(alignment: .top, spacing: 6) {
             ForEach(shown) { s in
-                AvatarButton(model: model, session: s)
+                AvatarButton(model: model, session: s, projectLabel: labels[s.cwd])
                     .transition(.scale(scale: 0.3).combined(with: .opacity))
             }
             if rest > 0 {
@@ -86,7 +88,7 @@ struct AvatarRow: View {
                     }
                 } label: {
                     Text("+\(rest)").font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .frame(width: 30, height: 30)
+                        .frame(width: 30, height: 40)
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
@@ -102,31 +104,40 @@ struct AvatarRow: View {
 struct AvatarButton: View {
     @ObservedObject var model: AppModel
     let session: AgentSession
+    var projectLabel: String? = nil
     @State private var hover = false
 
     var body: some View {
         let selected = model.selectedKey == session.id
         Button { model.select(session.id) } label: {
-            AvatarView(seed: session.avatarSeed, state: session.state, style: model.settings.avatarStyle, size: 34,
-                       animated: model.settings.animations, kind: session.kind)
-                .padding(3)
-                .background {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(selected ? Color.accentColor.opacity(0.18) : (hover ? Color.primary.opacity(0.07) : .clear))
+            VStack(spacing: 2) {
+                AvatarView(seed: session.avatarSeed, state: session.state, style: model.settings.avatarStyle, size: 34,
+                           animated: model.settings.animations, kind: session.kind)
+                    .padding(3)
+                if let projectLabel {
+                    ProjectChip(cwd: session.cwd, label: projectLabel)
+                        .frame(maxWidth: 58)
                 }
-                .contentShape(Rectangle())
+            }
+            .padding(.bottom, projectLabel == nil ? 0 : 2)
+            .background {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(selected ? Color.accentColor.opacity(0.18) : (hover ? Color.primary.opacity(0.07) : .clear))
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hover = $0 }
         .help(tooltip)
         .contextMenu {
-            Button(session.host.isDesktopApp ? "Открыть в приложении" : "Открыть в терминале") { model.open(session.id) }
+            Button(session.host.openTitle) { model.open(session.id) }
+            Button("Карта агентов") { model.openMap() }
             Button("Скрыть") { model.hide(session.id) }
         }
     }
 
     private var tooltip: String {
-        var parts = ["\(session.projectName) — \(session.state.title)"]
+        var parts = ["\(session.projectName) — \(session.state.title) · \(session.host.label)"]
         if !session.title.isEmpty { parts.append(session.title) }
         if let step = session.currentStep { parts.append(step.summary) }
         return parts.joined(separator: "\n")
@@ -148,20 +159,26 @@ struct SessionCard: View {
                     case .permission(let tool, let input):
                         PermissionView(model: model, session: session, request: p, tool: tool, input: input)
                     case .question(let qs, _):
-                        QuestionView(model: model, desktop: session.host.isDesktopApp, request: p, questions: qs)
+                        QuestionView(model: model, host: session.host, request: p, questions: qs)
+                    case .plan(let text, _):
+                        PlanView(model: model, session: session, request: p, text: text)
                     }
                 }
                 .id(p.id)
             } else if let p = session.expiredPending {
                 ExpiredView(model: model, session: session, request: p)
             } else if session.state.needsUser {
-                Notice(icon: session.host.isDesktopApp ? "macwindow" : "terminal", color: .orange,
-                       text: (session.host.isDesktopApp ? "Агент ждёт ответа в приложении" : "Агент ждёт ответа в терминале")
+                Notice(icon: session.host.placeSymbol, color: .orange,
+                       text: "Агент ждёт ответа \(session.host.placeIn)"
                            + (session.waitingNote.map { ": «\($0.count > 160 ? String($0.prefix(159)) + "…" : $0)»" } ?? "."),
                        actions: [("Открыть", { model.open(session.id) })])
             }
             if let msg = session.lastMessage, session.state == .done || session.state == .error {
                 LastMessageView(text: msg, failed: session.state == .error)
+            }
+            if session.host.canPrefillPrompt, session.activePending == nil,
+               [.done, .idle, .error].contains(session.state) {
+                NextPromptBar(model: model, session: session)
             }
             StepsList(session: session)
         }
@@ -176,15 +193,20 @@ struct SessionCard: View {
                        kind: session.kind)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
+                    ProjectDot(cwd: session.cwd)
                     Text(session.projectName).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                    Text(session.state.title)
+                }
+                HStack(spacing: 6) {
+                    Text(session.activePending?.kind.isPlan == true ? "Ждёт одобрения" : session.state.title)
                         .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .lineLimit(1)
+                        .padding(.horizontal, 6).padding(.vertical, 1.5)
                         .background(Capsule().fill(session.state.tint.opacity(0.16)))
                         .foregroundStyle(session.state.tint)
-                }
-                if !session.title.isEmpty {
-                    Text(session.title).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                        .fixedSize()
+                    if !session.title.isEmpty {
+                        Text(session.title).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    }
                 }
                 TimelineView(.periodic(from: .now, by: 30)) { ctx in
                     Text(subtitle(now: ctx.date)).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
@@ -192,7 +214,8 @@ struct SessionCard: View {
             }
             Spacer(minLength: 4)
             HStack(spacing: 2) {
-                IconButton(symbol: "arrow.up.forward.app", help: session.host.isDesktopApp ? "Открыть сессию в приложении" : "Открыть в терминале") { model.open(session.id) }
+                IconButton(symbol: "arrow.up.forward.app", help: session.host.openTitle) { model.open(session.id) }
+                IconButton(symbol: "map", help: "Карта агентов: все сессии и что они делают") { model.openMap() }
                 IconButton(symbol: "eye.slash", help: "Скрыть") { model.hide(session.id) }
                 IconButton(symbol: "xmark", help: "Закрыть окошко") { model.select(nil) }
                     .keyboardShortcut(.cancelAction)
@@ -206,6 +229,51 @@ struct SessionCard: View {
         parts.append(Fmt.elapsed(from: session.startedAt, to: session.finishedAt ?? now))
         if let m = session.model { parts.append(m.replacingOccurrences(of: "claude-", with: "")) }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// Следующая задача для сессии в VS Code: текст попадёт в поле ввода её чата, отправляешь сам.
+struct NextPromptBar: View {
+    @ObservedObject var model: AppModel
+    let session: AgentSession
+    @State private var text = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                TextField("Следующая задача…", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+                    .onSubmit(send)
+                Button(action: send) { Image(systemName: "arrow.up.forward.app") }
+                    .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .help("Открыть сессию в VS Code с этим текстом в поле ввода (отправишь сам)")
+            }
+            if !model.settings.quickPrompts.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(model.settings.quickPrompts, id: \.self) { p in
+                            Button { model.prefillPrompt(session.id, p) } label: {
+                                Text(p).font(.system(size: 11)).lineLimit(1)
+                                    .padding(.horizontal, 8).padding(.vertical, 3)
+                                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Вставить «\(p)» в поле ввода сессии")
+                        }
+                    }
+                }
+                .frame(height: 22)
+            }
+        }
+        .controlSize(.small)
+    }
+
+    private func send() {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        model.prefillPrompt(session.id, t)
+        text = ""
     }
 }
 
@@ -362,6 +430,7 @@ enum Fmt {
         case "Task", "Agent", "Subagent": return "person.2"
         case "TodoWrite": return "checklist"
         case "AskUserQuestion": return "questionmark.bubble"
+        case "ExitPlanMode": return "list.bullet.clipboard"
         case "Skill": return "sparkles"
         default: return tool.hasPrefix("mcp__") ? "puzzlepiece.extension" : "wrench.and.screwdriver"
         }

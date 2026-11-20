@@ -86,6 +86,7 @@ func events(_ m: HookMessage, at t: Date = t0) -> [AgentEvent] { adapter.events(
     @Test(arguments: [
         Decision.allow, .deny(reason: "нельзя"), .deny(reason: nil),
         .answer(["Цвет?": "Red, Blue"]), .passthrough,
+        .allowWith([["type": "setMode", "mode": "acceptEdits", "destination": "session"]]),
     ])
     func replyRoundTrip(_ d: Decision) throws {
         let r = HookReply(requestId: "abc", decision: d)
@@ -125,8 +126,10 @@ func events(_ m: HookMessage, at t: Date = t0) -> [AgentEvent] { adapter.events(
 
     @Test func permissionAndQuestionModes() throws {
         let p = try #require(events(try message("permission-PermissionRequest", mode: .permission, rid: "p1", deadline: t0)).first)
-        guard case .permissionRequested("p1", "Bash", let input, t0) = p.body else { Issue.record("\(p.body)"); return }
+        guard case .permissionRequested("p1", "Bash", let input, t0, let suggestions) = p.body else { Issue.record("\(p.body)"); return }
         #expect(input["command"]?.stringValue?.contains("node -e") == true)
+        #expect(suggestions.count == 1)
+        #expect(suggestions.first?["destination"] == "localSettings")
 
         let q = try #require(events(try message("question-PreToolUse-AskUserQuestion", mode: .question, rid: "q1", deadline: t0)).first)
         guard case .questionAsked("q1", let qs, _, _) = q.body else { Issue.record("\(q.body)"); return }
@@ -140,8 +143,9 @@ func events(_ m: HookMessage, at t: Date = t0) -> [AgentEvent] { adapter.events(
         var ask = try fixture("permission-PermissionRequest")
         ask["tool_name"] = "AskUserQuestion"
         #expect(!adapter.shouldForward(mode: .permission, payload: ask))
+        // План теперь отвечаем из HUD (окошко «План готов — одобрить?»).
         ask["tool_name"] = "ExitPlanMode"
-        #expect(!adapter.shouldForward(mode: .permission, payload: ask))
+        #expect(adapter.shouldForward(mode: .permission, payload: ask))
         #expect(adapter.shouldForward(mode: .question, payload: try fixture("question-PreToolUse-AskUserQuestion")))
         #expect(!adapter.shouldForward(mode: .question, payload: try fixture("PreToolUse-Bash")))
     }
@@ -510,6 +514,7 @@ func events(_ m: HookMessage, at t: Date = t0) -> [AgentEvent] { adapter.events(
         #expect(!HostProbe.isInteractive(kind: .claude, host: claudeApp, env: ["CLAUDE_CODE_ENTRYPOINT": "claude-desktop"]))
         #expect(!HostProbe.isInteractive(kind: .claude, host: tty, env: ["CLAUDE_CODE_ENTRYPOINT": "sdk-cli"]))
         #expect(!HostProbe.isInteractive(kind: .claude, host: HostInfo(), env: ["CLAUDE_CODE_ENTRYPOINT": "cli"]))
+        // claude-vscode без процесса VS Code среди предков — не настоящая панель расширения.
         #expect(!HostProbe.isInteractive(kind: .claude, host: tty, env: ["CLAUDE_CODE_ENTRYPOINT": "claude-vscode"]))
         // codex exec из скрипта: ни TTY, ни приложения
         #expect(!HostProbe.isInteractive(kind: .codex, host: HostInfo(), env: [:]))
@@ -524,5 +529,265 @@ func events(_ m: HookMessage, at t: Date = t0) -> [AgentEvent] { adapter.events(
     @Test func hostRoundTrip() {
         let h = HostInfo(tty: nil, agentPid: 5, appBundleId: HostInfo.codexDesktop, appName: "Codex", hostSessionId: "x")
         #expect(HostInfo(json: h.toJSON()) == h)
+    }
+}
+
+// MARK: - VS Code
+
+@Suite struct VSCodeTests {
+    let vscode = HostInfo(agentPid: 7, processChain: ["claude", "Code Helper (Plugin)", "Code"],
+                          appBundleId: HostInfo.vscode, appName: "Code", entrypoint: HostInfo.vscodeEntrypoint)
+
+    @Test func vscodeSessionsAreInteractive() {
+        #expect(HostProbe.isInteractive(kind: .claude, host: vscode, env: ["CLAUDE_CODE_ENTRYPOINT": "claude-vscode"]))
+        // Другие редакторы и SDK по-прежнему мимо.
+        let cursor = HostInfo(appBundleId: "com.todesktop.230313mzl4w4u92", entrypoint: "claude-vscode")
+        #expect(!HostProbe.isInteractive(kind: .claude, host: cursor, env: ["CLAUDE_CODE_ENTRYPOINT": "claude-vscode"]))
+        #expect(!HostProbe.isInteractive(kind: .claude, host: vscode, env: ["CLAUDE_CODE_ENTRYPOINT": "sdk-ts"]))
+    }
+
+    @Test func placeAndLabels() {
+        #expect(vscode.isEditor && vscode.place == .editor && !vscode.isDesktopApp)
+        #expect(vscode.label == "VS Code")
+        let term = HostInfo(termProgram: "vscode", tty: "/dev/ttys009", entrypoint: "cli")
+        #expect(term.isEditorTerminal && term.place == .terminal)
+        #expect(term.label == "терминал VS Code")
+        #expect(HostInfo(appBundleId: HostInfo.claudeDesktop, hostSessionId: "local_1").place == .desktopApp)
+        #expect(HostInfo(termProgram: "Apple_Terminal", tty: "/dev/ttys001").place == .terminal)
+    }
+
+    @Test func entrypointSurvivesRoundTripAndMerge() {
+        #expect(HostInfo(json: vscode.toJSON()) == vscode)
+        let merged = SessionStore.merge(vscode, HostInfo(agentPid: 9))
+        #expect(merged.entrypoint == HostInfo.vscodeEntrypoint && merged.agentPid == 9)
+    }
+}
+
+// MARK: - Разрешить всегда
+
+@Suite struct PermissionRulesTests {
+    @Test func bashPatterns() {
+        #expect(PermissionRules.bashPattern("npm run build") == "npm run *")
+        #expect(PermissionRules.bashPattern("git status") == "git status *")
+        #expect(PermissionRules.bashPattern("npx expo start --clear") == "npx expo *")
+        #expect(PermissionRules.bashPattern("kill 41684 41849") == "kill *")
+        #expect(PermissionRules.bashPattern("ls") == nil)                       // одно слово — точное правило
+        #expect(PermissionRules.bashPattern("git -C x status") == nil)          // флаг вторым словом
+        #expect(PermissionRules.bashPattern("npm test && npm run lint") == nil) // составная
+        #expect(PermissionRules.bashPattern("rm -rf dist") == nil)              // опасно шаблонить
+        #expect(PermissionRules.bashPattern("node -e 'x'") == nil)              // произвольный код
+        #expect(PermissionRules.bashPattern("FOO=1 npm test") == nil)
+        #expect(PermissionRules.bashPattern("cat a.txt | head") == nil)
+    }
+
+    @Test func optionsCombineTemplateAndSuggestions() throws {
+        let payload = try fixture("permission-PermissionRequest")
+        var input = JSONObject()
+        input["command"] = "npm run test:unit"
+        let opts = PermissionRules.options(toolName: "Bash", input: .object(input),
+                                           suggestions: payload["permission_suggestions"]?.arrayValue ?? [])
+        #expect(opts.count == 3)
+        #expect(opts[0].title == "Bash(npm run *)" && opts[0].scope == "в этом проекте" && opts[0].generated)
+        #expect(opts[1].update["destination"] == "userSettings")
+        #expect(opts[2].generated == false && opts[2].title.hasPrefix("Bash(node -e"))
+        // Подсказку Claude возвращаем без изменений (так велит документация).
+        #expect(opts[2].update == payload["permission_suggestions"]?[0])
+    }
+
+    @Test func mcpGetsWholeToolRuleWithoutContent() {
+        let opts = PermissionRules.options(toolName: "mcp__figma__get_file", input: [:], suggestions: [])
+        #expect(opts.count == 1)
+        #expect(opts[0].update["rules"]?[0]?["ruleContent"] == nil)
+        #expect(opts[0].update["rules"]?[0]?["toolName"] == "mcp__figma__get_file")
+    }
+
+    @Test func describesEntries() {
+        #expect(PermissionRules.describe(["type": "setMode", "mode": "acceptEdits", "destination": "session"])
+                == "Принимать правки файлов без вопросов")
+        #expect(PermissionRules.describe(["type": "setMode", "mode": "bypassPermissions", "destination": "session"]) == nil)
+        #expect(PermissionRules.describe(["type": "addRules", "behavior": "deny", "rules": [["toolName": "Bash"]]]) == nil)
+    }
+
+    @Test func allowWithOutputs() throws {
+        let payload = try fixture("permission-PermissionRequest")
+        let rule = try #require(payload["permission_suggestions"]?.arrayValue?.first)
+        let out = try JSONValue.parse(try #require(adapter.hookOutput(for: .allowWith([rule]), mode: .permission, payload: payload)))
+        let d = try #require(out["hookSpecificOutput"]?["decision"])
+        #expect(d["behavior"] == "allow")
+        #expect(d["updatedPermissions"]?.arrayValue == [rule])
+        #expect(d["updatedInput"] == nil)   // updatedInput только для плана
+        // Codex правил не понимает — разовое allow.
+        let codex = try JSONValue.parse(try #require(CodexAdapter().hookOutput(for: .allowWith([rule]), mode: .permission, payload: payload)))
+        #expect(codex["hookSpecificOutput"]?["decision"]?["updatedPermissions"] == nil)
+        #expect(Decision.allowWith([rule]).logLabel == "разрешено всегда")
+    }
+}
+
+// MARK: - План (ExitPlanMode)
+
+@Suite struct PlanTests {
+    @Test func planBecomesPlanRequest() throws {
+        var st = SessionStore()
+        for e in events(try message("SessionStart")) { st.apply(e) }
+        for e in events(try message("permission-ExitPlanMode", mode: .permission, rid: "plan1", deadline: t0.addingTimeInterval(500))) {
+            st.apply(e)
+        }
+        let s = try #require(st.session("claude:11111111-2222-3333-4444-555555555555"))
+        guard case .plan(let text, _) = s.activePending?.kind else { Issue.record("\(String(describing: s.activePending))"); return }
+        #expect(text.contains("Добавить фильтр"))
+        #expect(s.state == .waitingPermission)
+    }
+
+    @Test func approveEchoesInputAndSetsMode() throws {
+        let payload = try fixture("permission-ExitPlanMode")
+        let out = try JSONValue.parse(try #require(adapter.hookOutput(
+            for: .allowWith(PermissionRules.planApproval(acceptEdits: true)), mode: .permission, payload: payload)))
+        let d = try #require(out["hookSpecificOutput"]?["decision"])
+        #expect(d["behavior"] == "allow")
+        #expect(d["updatedInput"] == payload["tool_input"])
+        #expect(d["updatedPermissions"]?[0]?["mode"] == "acceptEdits")
+        #expect(d["updatedPermissions"]?[0]?["destination"] == "session")
+        // Обычное allow для плана тоже несёт updatedInput.
+        let plain = try JSONValue.parse(try #require(adapter.hookOutput(for: .allow, mode: .permission, payload: payload)))
+        #expect(plain["hookSpecificOutput"]?["decision"]?["updatedInput"] == payload["tool_input"])
+    }
+
+    @Test func reviseSendsFeedback() throws {
+        let payload = try fixture("permission-ExitPlanMode")
+        let out = try JSONValue.parse(try #require(adapter.hookOutput(for: .deny(reason: "без миграций"), mode: .permission, payload: payload)))
+        let msg = out["hookSpecificOutput"]?["decision"]?["message"]?.stringValue ?? ""
+        #expect(msg.contains("без миграций") && msg.contains("план"))
+        let empty = try JSONValue.parse(try #require(adapter.hookOutput(for: .deny(reason: nil), mode: .permission, payload: payload)))
+        #expect(empty["hookSpecificOutput"]?["decision"]?["message"]?.stringValue?.contains("план") == true)
+    }
+
+    @Test func postToolUseResolvesPlan() throws {
+        var st = SessionStore()
+        for e in events(try message("permission-ExitPlanMode", mode: .permission, rid: "plan1", deadline: t0.addingTimeInterval(500))) {
+            st.apply(e)
+        }
+        let done = AgentEvent(kind: .claude, sessionId: "11111111-2222-3333-4444-555555555555", time: t0.addingTimeInterval(5),
+                              body: .toolFinished(toolName: "ExitPlanMode", input: [:], toolUseId: nil, durationMs: 1, failed: false))
+        #expect(st.apply(done) == ["plan1"])
+    }
+}
+
+// MARK: - Имена проектов
+
+@Suite struct ProjectNamesTests {
+    @Test func displayNames() {
+        #expect(ProjectNames.displayName(cwd: "/Users/dev/acme-hrm/front") == "acme-hrm/front")
+        #expect(ProjectNames.displayName(cwd: "/Users/dev/acme-web-client") == "acme-web-client")
+        #expect(ProjectNames.displayName(cwd: "/") == "/")
+    }
+
+    @Test func shortLabelsDropCommonPrefixAndResolveClashes() {
+        let l = ProjectNames.shortLabels(for: [
+            "/d/acme-mobile-app", "/d/acme-web-client", "/d/acme-platform", "/d/acme-hrm/front", "/d/acme.hrm.v2",
+        ])
+        #expect(l["/d/acme-mobile-app"] == "mobile")
+        #expect(l["/d/acme-web-client"] == "web")
+        #expect(l["/d/acme-platform"] == "platform")
+        #expect(l["/d/acme-hrm/front"] == "hrm-front")
+        #expect(l["/d/acme.hrm.v2"] == "hrm-v2")
+        #expect(Set(l.values).count == 5)
+    }
+
+    @Test func singleAndUnrelated() {
+        #expect(ProjectNames.shortLabels(for: ["/d/taklif"]) == ["/d/taklif": "taklif"])
+        #expect(ProjectNames.shortLabels(for: ["/d/a-very-long-project-name"])["/d/a-very-long-project-name"]?.count == 9)
+        let l = ProjectNames.shortLabels(for: ["/d/taklif", "/d/qr-menu", "/d/taklif"])
+        #expect(l == ["/d/taklif": "taklif", "/d/qr-menu": "qr"])
+    }
+
+    @Test func stableHue() {
+        #expect(ProjectNames.hue(cwd: "/a") == ProjectNames.hue(cwd: "/a"))
+        #expect((0..<1).contains(ProjectNames.hue(cwd: "/b")))
+    }
+}
+
+// MARK: - Журнал активности и сводка
+
+@Suite struct ActivityTests {
+    func rec(_ k: ActivityRecord.Kind, _ dt: TimeInterval, _ sid: String, _ cwd: String, _ text: String,
+             detail: String? = nil, failed: Bool = false, stats: TurnStats? = nil) -> ActivityRecord {
+        ActivityRecord(kind: k, time: t0.addingTimeInterval(dt), agent: "claude", session: sid,
+                       project: ProjectNames.displayName(cwd: cwd), cwd: cwd, text: text, detail: detail, failed: failed, stats: stats)
+    }
+
+    @Test func recordRoundTrip() {
+        let r = rec(.stop, 10, "s", "/p", "итог", failed: true,
+                    stats: TurnStats(tools: ["Edit": 2, "Bash": 1], files: ["a.ts"], subagents: 1, durationSec: 90))
+        #expect(ActivityRecord(json: r.toJSON()) == r)
+        #expect(ActivityRecord(json: ["kind": "nope"]) == nil)
+    }
+
+    @Test func buildPairsPromptsWithStops() {
+        let st = TurnStats(tools: ["Edit": 3, "Bash": 2], files: ["src/a.ts", "src/b.ts"], durationSec: 600)
+        let days = DailySummary.build([
+            rec(.prompt, 0, "s1", "/d/mobile-app", "Почини экран"),
+            rec(.prompt, 30, "s2", "/d/web-client", "Обнови тексты"),
+            rec(.stop, 600, "s1", "/d/mobile-app", "Готово", stats: st),
+            rec(.decision, 100, "s1", "/d/mobile-app", "$ npm test", detail: "разрешено"),
+            rec(.prompt, 700, "s1", "/d/mobile-app", "Ещё задача"),
+        ])
+        #expect(days.map(\.name) == ["mobile-app", "web-client"])
+        #expect(days[0].turns.count == 2)
+        #expect(days[0].turns[0].end != nil && days[0].turns[0].stats.edits == 3 && days[0].turns[0].message == "Готово")
+        #expect(days[0].turns[1].end == nil)
+        #expect(days[0].decisions == ["разрешено": 1])
+        #expect(days[0].workedSec == 600 && days[0].commands == 2)
+        #expect(days[1].turns[0].end == nil)
+    }
+
+    @Test func markdown() {
+        let st = TurnStats(tools: ["Edit": 3, "Bash": 2], files: ["src/a.ts"], durationSec: 1500)
+        let md = DailySummary.markdown(DailySummary.build([
+            rec(.prompt, 0, "s1", "/d/mobile-app", "Почини экран\nвторая строка"),
+            rec(.stop, 1500, "s1", "/d/mobile-app", "Готово, тесты зелёные", stats: st),
+        ]), day: t0)
+        #expect(md.hasPrefix("# Сводка агентов · "))
+        #expect(md.contains("**Итого:** 1 задача в 1 проекте · агенты работали 25 мин"))
+        #expect(md.contains("## mobile-app"))
+        #expect(md.contains("Почини экран — готово за 25 мин · правок 3 · команд 2"))
+        #expect(!md.contains("вторая строка"))
+        #expect(md.contains("  - Итог: Готово, тесты зелёные"))
+        #expect(md.contains("  - Файлы: a.ts"))
+        #expect(DailySummary.markdown([], day: t0).contains("ничего не делали"))
+    }
+
+    @Test func helpers() {
+        #expect(DailySummary.duration(30) == "меньше минуты")
+        #expect(DailySummary.duration(3720) == "1 ч 02 мин")
+        #expect(DailySummary.plural(1, "задача", "задачи", "задач") == "задача")
+        #expect(DailySummary.plural(3, "задача", "задачи", "задач") == "задачи")
+        #expect(DailySummary.plural(11, "задача", "задачи", "задач") == "задач")
+    }
+
+    @Test func fileAppendAndRead() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ahud-act-\(UUID().uuidString)")
+        setenv("AGENTHUD_SUPPORT_DIR", dir.path, 1)
+        defer { unsetenv("AGENTHUD_SUPPORT_DIR"); try? FileManager.default.removeItem(at: dir) }
+        let a = rec(.prompt, 0, "s", "/p", "раз"), b = rec(.stop, 5, "s", "/p", "два")
+        ActivityLog.append(a)
+        ActivityLog.append(b)
+        #expect(ActivityLog.read(day: t0) == [a, b])
+    }
+
+    @Test func turnStatsFromSession() throws {
+        var st = SessionStore()
+        for e in events(try message("UserPromptSubmit"), at: t0) { st.apply(e) }
+        func tool(_ name: String, _ input: JSONValue, _ id: String, _ dt: TimeInterval) {
+            st.apply(AgentEvent(kind: .claude, sessionId: "11111111-2222-3333-4444-555555555555", cwd: "/Users/dev/project",
+                                time: t0.addingTimeInterval(dt), body: .toolStarted(toolName: name, input: input, toolUseId: id)))
+        }
+        tool("Edit", ["file_path": "/Users/dev/project/src/a.ts"], "1", 1)
+        tool("Edit", ["file_path": "/Users/dev/project/src/a.ts"], "2", 2)
+        tool("Bash", ["command": "npm test"], "3", 3)
+        let s = try #require(st.session("claude:11111111-2222-3333-4444-555555555555"))
+        let stats = s.turnStats(until: t0.addingTimeInterval(60))
+        #expect(stats.edits == 2 && stats.commands == 1)
+        #expect(stats.files == ["src/a.ts"])
+        #expect(stats.durationSec == 60)
     }
 }
